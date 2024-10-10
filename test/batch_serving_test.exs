@@ -143,4 +143,38 @@ defmodule BatchServingTest do
     assert [0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5] ==
              BatchServing.run(serving, half_batch)
   end
+
+  defmodule ServingModule do
+    @behaviour BatchServing
+
+    @impl true
+    def init(_inline_or_process, :unused_arg, [_options]) do
+      {:ok, fn a -> Enum.map(IO.inspect(a.stack), &(&1 * &1)) end}
+    end
+
+    @impl true
+    def handle_batch(batch, 0, function) do
+      {:execute, fn -> {function.(batch), :server_info} end, function}
+    end
+  end
+
+  test "module" do
+    {:ok, _pid} =
+      start_supervised(%{id: Serving.PG, start: {:pg, :start_link, [Serving.PG]}})
+
+    {:ok, _pid} =
+      start_supervised(
+        {BatchServing,
+         serving: BatchServing.new(ServingModule, :unused_arg),
+         name: MyServing,
+         batch_size: 3,
+         batch_timeout: 100}
+      )
+
+    batch1 = BatchServing.Batch.stack([1, 2, 3])
+    batch2 = BatchServing.Batch.stack([4, 5])
+
+    assert [1, 4, 9, 16, 25] ==
+             BatchServing.batched_run(MyServing, [batch1, batch2])
+  end
 end

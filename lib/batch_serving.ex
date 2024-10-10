@@ -8,7 +8,7 @@ defmodule BatchServing do
 
   More specifically, servings are a mechanism to apply a computation on a
   `BatchServing.Batch`, with hooks for preprocessing input from and postprocessing
-  output for the client. Thus we can think of an instance of `t:Serving.t/0`
+  output for the client. Thus we can think of an instance of `t:BatchServing.t/0`
   (a serving) as something that encapsulates batches of Nx computations.
 
   ## Inline/serverless workflow
@@ -151,13 +151,11 @@ defmodule BatchServing do
   like this:
 
       defmodule MyServing do
-        @behaviour Serving
+        @behaviour BatchServing
 
         @impl true
         def init(_inline_or_process, :unused_arg, [defn_options]) do
-          {:ok, fn _opts ->
-              fn a -> Enum.map(IO.inspect(a.stack), &(&1 * &1)) end
-          end)}
+          {:ok, fn a -> Enum.map(IO.inspect(a.stack), &(&1 * &1)) end}
         end
 
         @impl true
@@ -687,7 +685,8 @@ defmodule BatchServing do
     name = opts[:name]
 
     if name == nil or not is_atom(name) do
-      raise ArgumentError, ":name option is expected when starting BatchServing and must be an atom"
+      raise ArgumentError,
+            ":name option is expected when starting BatchServing and must be an atom"
     end
 
     opts[:serving] ||
