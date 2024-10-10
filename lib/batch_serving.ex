@@ -672,7 +672,7 @@ defmodule BatchServing do
   defp run_execute(batch, module, state) do
     {:execute, function, _} = handle_batch(module, batch, 0, state)
 
-    :telemetry.span([:nx, :serving, :execute], %{module: module}, fn ->
+    :telemetry.span([:batch_serving, :serving, :execute], %{module: module}, fn ->
       {output, metadata} = handle_executed(module, function.())
       {{output, metadata}, %{module: module, metadata: metadata}}
     end)
@@ -1426,7 +1426,7 @@ defmodule BatchServing do
       {:execute, function, module_state} = handle_batch(module, batch, partition, module_state)
 
       wrapped_function = fn ->
-        :telemetry.span([:nx, :serving, :execute], %{module: module}, fn ->
+        :telemetry.span([:batch_serving, :serving, :execute], %{module: module}, fn ->
           if hooks_table do
             :ets.insert(hooks_table, {partition, ref_sizes})
           end
@@ -1568,7 +1568,7 @@ defmodule BatchServing do
   defp handle_preprocessing(preprocessing, input) do
     meta = %{input: input}
 
-    :telemetry.span([:nx, :serving, :preprocessing], meta, fn ->
+    :telemetry.span([:batch_serving, :serving, :preprocessing], meta, fn ->
       result = preprocessing.(input)
 
       case result do
@@ -1607,7 +1607,7 @@ defmodule BatchServing do
   defp handle_postprocessing(postprocessing, result, info) do
     meta = %{info: info}
 
-    :telemetry.span([:nx, :serving, :postprocessing], meta, fn ->
+    :telemetry.span([:batch_serving, :serving, :postprocessing], meta, fn ->
       {postprocessing.(result, info), meta}
     end)
   end
