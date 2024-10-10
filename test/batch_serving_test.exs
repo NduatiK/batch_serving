@@ -123,7 +123,7 @@ defmodule BatchServingTest do
              |> Enum.to_list()
   end
 
-  test " keys" do
+  test "keys" do
     serving =
       BatchServing.new(fn
         :double, _opts -> &Enum.map(&1.stack, fn v -> v * 2 end)

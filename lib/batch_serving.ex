@@ -22,21 +22,9 @@ defmodule BatchServing do
       iex> BatchServing.run(serving, batch)
       [1, 4, 9, 16]
 
-  We started the serving by passing a function that receives
-  compiler options and returns a JIT or AOT compiled function.
-  We called `Nx.Defn.jit/2` passing the options received as
-  argument, which will customize the JIT/AOT compilation.
-
-  You should see two values printed. The former is the result of
-  `Nx.Defn.Kernel.print_value/1`, which shows the tensor that was
-  actually part of the computation and how it was batched.
-  The latter is the result of the computation.
-
   When defining a `Serving`, we can also customize how the data is
   batched by using the `client_preprocessing` as well as the result by
-  using `client_postprocessing` hooks. Let's give it another try,
-  this time using `jit/2` to create the serving, which automatically
-  wraps the given function in `Nx.Defn.jit/2` for us:
+  using `client_postprocessing` hooks.
 
       iex> serving = (
       ...>   BatchServing.new(fn _opts -> fn a -> Enum.map(a.stack, &(&1 * &1)) end end)
@@ -179,8 +167,7 @@ defmodule BatchServing do
       end
 
   It has two functions. The first, `c:init/3`, receives the type of serving
-  (`:inline` or `:process`) and the serving argument. In this step,
-  we capture `print_and_multiply/1`as a jitted function.
+  (`:inline` or `:process`) and the serving argument.
 
   The second function is called `c:handle_batch/3`. This function
   receives a `BatchServing.Batch` and returns a function to execute.
@@ -336,16 +323,11 @@ defmodule BatchServing do
 
   It expects a single- or double-arity function. If a single-arity
   function is given, it receives the compiler options and must
-  return a JIT (via `Nx.Defn.jit/2`) or AOT compiled (via
-  `Nx.Defn.compile/3`) one-arity function.
+  return a one-arity function.
 
   If a double-arity function is given, it receives the batch
   key as first argument and the compiler options as second argument.
-  It must return a JIT (via `Nx.Defn.jit/2`) or AOT compiled
-  (via `Nx.Defn.compile/3`) one-arity function, but in practice
-  it will be a `Nx.Defn.compile/3`, since the purpose of the
-  batch key is often to precompile different versions of the
-  same function upfront. The batch keys can be given on
+  It must return a one-arity function. The batch keys can be given on
   `start_link/1`.
 
   The function will be called with the arguments returned by the

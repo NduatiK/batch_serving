@@ -1,6 +1,6 @@
 defmodule BatchServing.Batch do
   @moduledoc """
-  Creates a batch of tensors (and containers).
+  Creates a batch of values.
 
   A batch is lazily traversed, concatenated, and padded upon `defn` invocation.
   """
@@ -35,7 +35,7 @@ defmodule BatchServing.Batch do
   @doc """
   Merges two batches.
 
-  The tensors on the left will appear before the tensors on the right.
+  The values on the left will appear before the values on the right.
 
   The size and padding of both batches are summed. The padding still
   applies only at the end of batch.
