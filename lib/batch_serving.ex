@@ -363,10 +363,6 @@ defmodule BatchServing do
   If you only want to batch within the serving process, you must set
   `:batch_size` via `process_options/2` (or on `start_link/1`).
 
-  Note that `:batch_size` only guarantees a batch does not go over a limit.
-  Batches are not automatically padded to the batch size. Such can be done
-  as necessary inside your serving function by calling `BatchServing.Batch.pad/2`.
-
   > #### Why batch on `run/2`? {: .info}
   >
   > By default, `run/2` does not place a limit on its input size. It always
@@ -723,8 +719,7 @@ defmodule BatchServing do
     * `:batch_size` - the maximum batch size. A default value can be set with
       `batch_size/2`, which applies to both `run/2` and `batched_run/2`.
       Setting this option only affects `batched_run/2` and it defaults to `1`
-      if none is set. Note batches received by the serving are not automatically
-      padded to the batch size, such can be done with `BatchServing.Batch.pad/2`.
+      if none is set.
 
     * `:batch_timeout` - the maximum time to wait, in milliseconds,
       before executing the batch (defaults to `100`ms)
