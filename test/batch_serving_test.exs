@@ -3,14 +3,14 @@ defmodule BatchServingTest do
 
   describe "inline" do
     test "simple inline" do
-      serving = BatchServing.new(fn _opts -> fn a -> Enum.map(a.stack, &(&1 * &1)) end end)
+      serving = BatchServing.new(fn a -> Enum.map(a.stack, &(&1 * &1)) end)
       batch = BatchServing.Batch.stack([1, 2, 3, 4])
       assert [1, 4, 9, 16] == BatchServing.run(serving, batch)
     end
 
     test "pre/post-processing inline" do
       serving =
-        BatchServing.new(fn _opts -> fn a -> Enum.map(a.stack, &(&1 * &1)) end end)
+        BatchServing.new(fn a -> Enum.map(a.stack, &(&1 * &1)) end)
         |> BatchServing.client_preprocessing(fn input -> {input, :client_info} end)
         |> BatchServing.client_postprocessing(&{&1, &2})
 
@@ -29,7 +29,7 @@ defmodule BatchServingTest do
       {:ok, _pid} =
         start_supervised(
           {BatchServing,
-           serving: BatchServing.new(fn _opts -> fn a -> Enum.map(a.stack, &(&1 * &1)) end end),
+           serving: BatchServing.new(fn a -> Enum.map(a.stack, &(&1 * &1)) end),
            name: MyServing,
            batch_size: 10,
            batch_timeout: 100}
@@ -50,10 +50,8 @@ defmodule BatchServingTest do
         start_supervised(
           {BatchServing,
            serving:
-             BatchServing.new(fn _opts ->
-               fn a ->
-                 Enum.map(a.stack, &(&1 * &1))
-               end
+             BatchServing.new(fn a ->
+               Enum.map(a.stack, &(&1 * &1))
              end)
              |> BatchServing.client_preprocessing(fn input ->
                input
@@ -99,10 +97,8 @@ defmodule BatchServingTest do
         start_supervised(
           {BatchServing,
            serving:
-             BatchServing.new(fn _opts ->
-               fn a ->
-                 Enum.map(a.stack, &(&1 * &1))
-               end
+             BatchServing.new(fn a ->
+               Enum.map(a.stack, &(&1 * &1))
              end),
            name: MyServing,
            batch_size: 2,
@@ -129,8 +125,8 @@ defmodule BatchServingTest do
     test "keys" do
       serving =
         BatchServing.new(fn
-          :double, _opts -> &Enum.map(&1.stack, fn v -> v * 2 end)
-          :half, _opts -> &Enum.map(&1.stack, fn v -> v / 2 end)
+          :double, batch -> Enum.map(batch.stack, fn v -> v * 2 end)
+          :half, batch -> Enum.map(batch.stack, fn v -> v / 2 end)
         end)
 
       double_batch =
@@ -152,7 +148,7 @@ defmodule BatchServingTest do
 
       @impl true
       def init(_inline_or_process, :unused_arg, [_options]) do
-        {:ok, fn a -> Enum.map(IO.inspect(a.stack), &(&1 * &1)) end}
+        {:ok, fn a -> Enum.map(a.stack, &(&1 * &1)) end}
       end
 
       @impl true
@@ -189,11 +185,9 @@ defmodule BatchServingTest do
         start_supervised(
           {BatchServing,
            serving:
-             BatchServing.new(fn _opts ->
-               fn a ->
-                 :timer.sleep(2_000)
-                 Enum.map(a.stack, &(&1 * &1))
-               end
+             BatchServing.new(fn a ->
+               :timer.sleep(2_000)
+               Enum.map(a.stack, &(&1 * &1))
              end),
            name: PartitionedServing,
            batch_size: 2,

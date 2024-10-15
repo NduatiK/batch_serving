@@ -17,7 +17,7 @@ defmodule BatchServing do
   or AOT compiled function to execute on batches of tensors:
 
 
-      iex> serving = BatchServing.new(fn _opts -> fn a -> Enum.map(a.stack, &(&1 * &1)) end end)
+      iex> serving = BatchServing.new(fn a -> Enum.map(a.stack, &(&1 * &1)) end)
       iex> batch = BatchServing.Batch.stack([1, 2, 3, 4])
       iex> BatchServing.run(serving, batch)
       [1, 4, 9, 16]
@@ -27,7 +27,7 @@ defmodule BatchServing do
   using `client_postprocessing` hooks.
 
       iex> serving = (
-      ...>   BatchServing.new(fn _opts -> fn a -> Enum.map(a.stack, &(&1 * &1)) end end)
+      ...>   BatchServing.new(fn a -> Enum.map(a.stack, &(&1 * &1)) end)
       ...>   |> BatchServing.client_preprocessing(fn input -> {input, :client_info} end)
       ...>   |> BatchServing.client_postprocessing(&{&1, &2})
       ...> )
@@ -67,7 +67,7 @@ defmodule BatchServing do
 
       children = [
         {BatchServing,
-         serving: BatchServing.new(fn _opts -> fn a -> Enum.map(IO.inspect(a.stack), &(&1 * &1)) end end),
+         serving: BatchServing.new(fn a -> Enum.map(IO.inspect(a.stack), &(&1 * &1)) end),
          name: MyServing,
          batch_size: 10,
          batch_timeout: 100}
@@ -217,8 +217,8 @@ defmodule BatchServing do
   templates:
 
       iex> serving = BatchServing.new(fn
-      ...>   :double, opts -> &Enum.map(&1.stack, fn v -> v * 2 end)
-      ...>   :half, opts -> &Enum.map(&1.stack, fn v -> v / 2 end)
+      ...>   :double, batch -> Enum.map(batch.stack, fn v -> v * 2 end)
+      ...>   :half, batch -> Enum.map(batch.stack, fn v -> v / 2 end)
       ...> end)
       iex> double_batch = BatchServing.Batch.concatenate([0, 1, 2, 3, 4, 5, 6, 7, 8, 9]) |> BatchServing.Batch.key(:double)
       iex> BatchServing.run(serving, double_batch)
@@ -1618,27 +1618,24 @@ defmodule BatchServing.Default do
         value =
           cond do
             is_function(fun, 1) ->
-              validate_batch_fun!(fun.(defn_options))
+              fun
 
             is_function(fun, 2) ->
-              {batch_keys, defn_options} = Keyword.pop!(defn_options, :batch_keys)
+              {batch_keys, _} = Keyword.pop!(defn_options, :batch_keys)
 
               for batch_key <- batch_keys,
                   into: %{},
-                  do: {batch_key, validate_batch_fun!(fun.(batch_key, defn_options))}
+                  do:
+                    {batch_key,
+                     fn value ->
+                       fun.(batch_key, value)
+                     end}
           end
 
         {index, value}
       end)
 
     {:ok, Map.new(batch_funs)}
-  end
-
-  defp validate_batch_fun!(batch_fun) when is_function(batch_fun, 1), do: batch_fun
-
-  defp validate_batch_fun!(other) do
-    raise "anonymous function given to BatchServing.new/2 should return an AOT or " <>
-            "JIT compiled function that expects one argument. Got: #{inspect(other)}"
   end
 
   @impl true
