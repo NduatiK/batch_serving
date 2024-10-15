@@ -103,16 +103,9 @@ defmodule BatchServing do
   ### Partitioning
 
   You can start several partitions under the same serving by passing
-  `partitions: true` when starting the serving. The number of partitions
-  will be determined according  your compiler and for which host it is
-  compiling.
+  `partitions: integer()` when starting the serving.
 
-  For example, when creating the serving, you may pass the following
-  `defn_options`:
-
-      BatchServing.new(computation, compiler: EXLA, client: :cuda)
-
-  Now when booting up the serving:
+  For example:
 
       children = [
         {BatchServing,
@@ -120,7 +113,7 @@ defmodule BatchServing do
          name: MyServing,
          batch_size: 10,
          batch_timeout: 100,
-         partitions: true}
+         partitions: 2}
       ]
 
   ### Distribution
@@ -680,6 +673,11 @@ defmodule BatchServing do
 
   ## Process API
 
+  @spec child_spec(maybe_improper_list()) :: %{
+          id: atom(),
+          start: {BatchServing, :start_link, [maybe_improper_list(), ...]},
+          type: :supervisor
+        }
   @doc false
   def child_spec(opts) when is_list(opts) do
     name = opts[:name]
@@ -723,9 +721,7 @@ defmodule BatchServing do
     * `:batch_timeout` - the maximum time to wait, in milliseconds,
       before executing the batch (defaults to `100`ms)
 
-    * `:partitions` - when `true`, starts several partitions under this serving.
-      The number of partitions will be determined according to your compiler
-      and for which host it is compiling. See the module docs for more information
+    * `:partitions` - The number of partitions (defaults to `1`)
 
     * `:shutdown` - the maximum time for the serving to shutdown. This will
       block until the existing computation finishes (defaults to `30_000`ms)
@@ -752,7 +748,7 @@ defmodule BatchServing do
       end
 
     shutdown = Keyword.get(opts, :shutdown, 30_000)
-    partitions = Keyword.get(opts, :partitions, false)
+    partitions = Keyword.get(opts, :partitions, 1)
     batch_keys = Keyword.get(opts, :batch_keys, [:default])
     batch_timeout = Keyword.get(opts, :batch_timeout, 100)
     process_options = Keyword.take(opts, [:name, :hibernate_after, :spawn_opt])
@@ -1138,10 +1134,12 @@ defmodule BatchServing do
   @timeout_message {__MODULE__, :timeout}
 
   @impl true
-  def init({name, serving, partitions?, batch_keys, batch_size, batch_timeout, task_supervisor}) do
+  def init({name, serving, partitions, batch_keys, batch_size, batch_timeout, task_supervisor}) do
     Process.flag(:trap_exit, true)
-    partitions_opts = serving_partitions(serving, partitions?)
+    partitions_opts = serving_partitions(serving, partitions)
+
     partitions_count = length(partitions_opts)
+
     {mode, partitions_opts, hooks_table} = serving_streaming(serving, partitions_opts)
     partitions_opts = Enum.map(partitions_opts, &Keyword.put(&1, :batch_keys, batch_keys))
     {:ok, module_state} = handle_init(serving.module, :process, serving.arg, partitions_opts)
@@ -1182,12 +1180,8 @@ defmodule BatchServing do
     {:ok, state}
   end
 
-  defp serving_partitions(%BatchServing{defn_options: defn_options}, true) do
-    [defn_options]
-  end
-
-  defp serving_partitions(%BatchServing{defn_options: defn_options}, false) do
-    [defn_options]
+  defp serving_partitions(%BatchServing{defn_options: defn_options}, partitions) do
+    List.duplicate(defn_options, partitions)
   end
 
   defp serving_streaming(%BatchServing{streaming: nil}, partitions) do
