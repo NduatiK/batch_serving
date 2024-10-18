@@ -90,12 +90,12 @@ defmodule BatchServing.Batch do
 
   ## Examples
 
-  iex> batch = BatchServing.Batch.concatenate(BatchServing.Batch.stack([1, 2]), [3, 4, 5])
-  iex> {left, right} = BatchServing.Batch.split(batch, 3)
-  iex> left.stack
-  [1, 2, 3]
-  iex> right.stack
-  [4, 5]
+    iex> batch = BatchServing.Batch.concatenate(BatchServing.Batch.stack([1, 2]), [3, 4, 5])
+    iex> {left, right} = BatchServing.Batch.split(batch, 3)
+    iex> left.stack
+    [1, 2, 3]
+    iex> right.stack
+    [4, 5]
   """
   def split(%BatchServing.Batch{} = batch, n) when is_integer(n) and n > 0 do
     %{stack: stack, size: size, key: key} = batch

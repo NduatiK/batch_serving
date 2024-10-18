@@ -9,12 +9,11 @@ defmodule BatchServing do
   More specifically, servings are a mechanism to apply a computation on a
   `BatchServing.Batch`, with hooks for preprocessing input from and postprocessing
   output for the client. Thus we can think of an instance of `t:BatchServing.t/0`
-  (a serving) as something that encapsulates batches of Nx computations.
+  (a serving) as something that encapsulates batches of computation.
 
   ## Inline/serverless workflow
 
-  We can use `new/1` to create a serving that will return a JIT
-  or AOT compiled function to execute on batches of tensors:
+  We can use `new/1` to create a serving that will execute on batches of work:
 
 
       iex> serving = BatchServing.new(fn a -> Enum.map(a.stack, &(&1 * &1)) end)
@@ -626,7 +625,8 @@ defmodule BatchServing do
         end
       end)
 
-    {pid, Process.monitor(pid, alias: :demonitor)}
+    # {pid, Process.monitor(pid, alias: :demonitor)}
+    {pid, :erlang.monitor(:process, pid, alias: :demonitor)}
   end
 
   defp run_hook(ref, size, result, hook) do
@@ -860,7 +860,8 @@ defmodule BatchServing do
 
     {preprocessed, info} = handle_preprocessing(preprocessing, input)
 
-    ref = Process.monitor(pid, alias: :demonitor)
+    ref = :erlang.monitor(:process, pid, alias: :demonitor)
+    # ref = Process.monitor(pid, alias: :demonitor)
 
     size_or_unknown =
       case preprocessed do
@@ -1215,7 +1216,8 @@ defmodule BatchServing do
 
   @impl true
   def handle_info({__MODULE__, :proxy_monitor, pid, ref}, state) do
-    Process.monitor(pid, tag: {:proxy, ref})
+    # Process.monitor(pid, tag: {:proxy, ref})
+    :erlang.monitor(:process, pid, tag: {:proxy, ref})
     {:noreply, state}
   end
 
