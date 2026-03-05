@@ -17,7 +17,7 @@ Add `batch_serving` to your dependencies:
 ```elixir
 def deps do
   [
-    {:batch_serving, "~> 0.1.5"}
+    {:batch_serving, "~> 1.0.0"}
   ]
 end
 ```
