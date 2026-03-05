@@ -3,13 +3,13 @@ defmodule BatchServing do
   BatchServing batches work submitted by concurrent callers and executes it
   as a single request based on batch size and timeout limits.
 
-  You can run a serving inline with `run/2`, or start a serving process and
-  submit requests with `batched_run/2` for transparent cross-caller batching.
+  You can execute a serving inline with `inline/2`, or start a serving process and
+  submit requests with `dispatch/2` for transparent cross-caller batching.
 
   Callbacks:
 
-    * `map_input/2` - map caller input into a list of values (or stream of value lists)
-    * `map_result/2` - map serving output into caller-facing result
+    * `map_inputs/2` - map caller input into a list of values (or stream of values)
+    * `map_results/2` - map serving output into caller-facing result
   """
 
   alias __MODULE__
@@ -19,8 +19,8 @@ defmodule BatchServing do
   defstruct [
     :module,
     :arg,
-    :map_input,
-    :map_result,
+    :map_inputs,
+    :map_results,
     :streaming,
     :batch_size,
     distributed_postprocessing: &Function.identity/1,
@@ -28,18 +28,17 @@ defmodule BatchServing do
     runtime_options: []
   ]
 
-  @type mapped_input_entry() :: list() | {term(), list()}
-  @type mapped_input() :: mapped_input_entry() | Enumerable.t(mapped_input_entry())
-  @type map_input() :: (term() -> mapped_input())
-  @type map_result() :: (term() -> term())
+  @type mapped_input() :: list() | Enumerable.t(term())
+  @type map_inputs() :: (term() -> mapped_input())
+  @type map_results() :: (term() -> term())
   @type distributed_preprocessing() :: (term() -> term())
   @type distributed_postprocessing() :: (term() -> term())
 
   @type t :: %__MODULE__{
           module: atom(),
           arg: term(),
-          map_input: map_input(),
-          map_result: map_result(),
+          map_inputs: map_inputs(),
+          map_results: map_results(),
           distributed_postprocessing: distributed_postprocessing(),
           process_options: keyword(),
           runtime_options: keyword(),
@@ -50,7 +49,6 @@ defmodule BatchServing do
   @process_keys [
     :batch_size,
     :batch_timeout,
-    :batch_keys,
     :partitions,
     :shutdown,
     :hibernate_after,
@@ -61,7 +59,7 @@ defmodule BatchServing do
   The callback used to initialize the serving.
 
   The first argument reveals if the serving is executed inline,
-  such as by calling `run/2`, by started with the process.
+  such as by calling `inline/2`, or started in a serving process.
   The second argument is the serving argument given to `new/2`.
   The third argument is a list of runtime options for each partition.
 
@@ -87,15 +85,12 @@ defmodule BatchServing do
   @doc """
   Creates a new function serving.
 
-  It expects either:
-
-    * a one-arity function that receives a list of values
-    * a two-arity function that receives `{batch_key, values}`
+  It expects a one-arity function that receives a list of values.
   """
   def new(function, runtime_options \\ [])
 
   def new(function, runtime_options)
-      when (is_function(function, 1) or is_function(function, 2)) and is_list(runtime_options) do
+      when is_function(function, 1) and is_list(runtime_options) do
     new(BatchServing.Default, function, runtime_options)
   end
 
@@ -106,23 +101,23 @@ defmodule BatchServing do
   @doc """
   Sets the batch size for this serving.
 
-  This batch size is used to split batches given to both `run/2` and
-  `batched_run/2`, enforcing that the batch size never goes over a limit.
+  This batch size is used to split batches given to both `inline/2` and
+  `dispatch/2`, enforcing that the batch size never goes over a limit.
   If you only want to batch within the serving process, you must set
   `:batch_size` via `process_options/2` (or on `start_link/1`).
 
-  > #### Why batch on `run/2`? {: .info}
+  > #### Why batch on `inline/2`? {: .info}
   >
-  > By default, `run/2` does not place a limit on its input size. It always
+  > By default, `inline/2` does not place a limit on its input size. It always
   > processes inputs directly within the current process. On the other hand,
-  > `batched_run/2` always sends your input to a separate process, which
+  > `dispatch/2` always sends your input to a separate process, which
   > will batch and execute the serving only once the batch is full or a
   > timeout has elapsed.
   >
-  > However, in some situations, an input given to `run/2` needs to be
+  > However, in some situations, an input given to `inline/2` needs to be
   > broken into several batches. If we were to very large batches to our
   > computation, the computation could require too much memory. In such
-  > cases, setting a batch size even on `run/2` is beneficial, because
+  > cases, setting a batch size even on `inline/2` is beneficial, because
   > BatchServing takes care of splitting a large batch into smaller ones
   > that do not exceed the `batch_size` value.
   """
@@ -150,21 +145,20 @@ defmodule BatchServing do
   The default implementation:
 
     * treats list input as one batch of values
-    * treats list-of-lists input as a stream of value-lists
-    * treats generic enumerable input as a stream of value-lists
+    * treats non-list enumerables (such as streams) as a stream of values
     * wraps any other term into a single-item list
   """
-  def map_input(%BatchServing{} = serving, function)
+  def map_inputs(%BatchServing{} = serving, function)
       when is_function(function, 1) or is_nil(function) do
-    %{serving | map_input: function}
+    %{serving | map_inputs: function}
   end
 
   @doc """
   Sets the result mapping function.
   """
-  def map_result(%BatchServing{} = serving, function)
+  def map_results(%BatchServing{} = serving, function)
       when is_function(function, 1) or is_nil(function) do
-    %{serving | map_result: function}
+    %{serving | map_results: function}
   end
 
   @doc """
@@ -180,9 +174,9 @@ defmodule BatchServing do
   @doc """
   Configure the serving to stream its results.
 
-  Once `run/2` or `batched_run/2` are invoked, it will then
+  Once `inline/2` or `dispatch/2` are invoked, it will then
   return a stream. The stream must be consumed in the same
-  process that calls `run/2` or `batched_run/2`.
+  process that calls `inline/2` or `dispatch/2`.
 
   Batches will be streamed as they arrive. You may also opt-in
   to stream `runtime` hooks.
@@ -261,24 +255,36 @@ defmodule BatchServing do
   end
 
   @doc """
-  Runs `serving` with the given `input` inline with the current process.
-
-  The `serving` is executed immediately, without waiting or batching inputs
-  from other processes. If a `batch_size/2` is specified, then the input may
-  be split or padded, but they are still executed immediately inline.
+  Runs `serving` for a single item inline with the current process.
   """
-  def run(%BatchServing{} = serving, input) do
+  def inline(%BatchServing{} = serving, item) do
+    [result] = do_run(serving, item, :single)
+    result
+  end
+
+  @doc """
+  Runs `serving` for explicit batch input inline with the current process.
+  """
+  def inline_many(%BatchServing{} = serving, batch_input) when is_list(batch_input) do
+    do_run(serving, batch_input, :batch)
+  end
+
+  def inline_many(%BatchServing{} = serving, %Stream{} = batch_input) do
+    do_run(serving, batch_input, :batch)
+  end
+
+  defp do_run(%BatchServing{} = serving, input, mode) do
     %{
       module: module,
       arg: arg,
-      map_input: preprocessing,
-      map_result: postprocessing,
+      map_inputs: preprocessing,
+      map_results: postprocessing,
       runtime_options: runtime_options,
       streaming: streaming,
       batch_size: limit
     } = serving
 
-    batch_or_stream = handle_preprocessing(preprocessing, input)
+    batch_or_stream = handle_preprocessing(preprocessing, input, mode)
     {pid_ref, runtime_options} = run_streaming(streaming, runtime_options, batch_or_stream, limit)
     stream = run_batch_or_stream(batch_or_stream, limit)
 
@@ -286,13 +292,12 @@ defmodule BatchServing do
       case pid_ref do
         {pid, ref} ->
           send(pid, {ref, module, arg, runtime_options, stream})
-          receive_stream("run/2", ref, :unknown)
+          receive_stream("inline/2", ref, :unknown)
 
         nil ->
           stream
-          |> Enum.map_reduce(nil, fn %BatchServing.Batch{key: key, size: size} = batch, cache ->
-            {:ok, state} =
-              cache || handle_init(module, :inline, arg, [[batch_keys: [key]] ++ runtime_options])
+          |> Enum.map_reduce(nil, fn %BatchServing.Batch{size: size} = batch, cache ->
+            {:ok, state} = cache || handle_init(module, :inline, arg, [runtime_options])
 
             {{run_execute(batch, module, state), size}, {:ok, state}}
           end)
@@ -326,7 +331,7 @@ defmodule BatchServing do
 
         _ ->
           raise ArgumentError,
-                "streaming hooks do not support input streaming; map_input must produce a single value list"
+                "streaming hooks do not support input streaming; map_inputs must produce a single value list"
       end
 
     {pid, ref} = run_streaming()
@@ -347,10 +352,8 @@ defmodule BatchServing do
         receive do
           {ref, module, arg, runtime_options, stream} ->
             Enum.reduce(stream, {0, nil}, fn
-              %BatchServing.Batch{key: key, size: size} = batch, {start, cache} ->
-                {:ok, state} =
-                  cache ||
-                    handle_init(module, :inline, arg, [[batch_keys: [key]] ++ runtime_options])
+              %BatchServing.Batch{size: size} = batch, {start, cache} ->
+                {:ok, state} = cache || handle_init(module, :inline, arg, [runtime_options])
 
                 output = run_execute(batch, module, state)
                 send(ref, {ref, {:batch, {0, size, output}}})
@@ -432,7 +435,7 @@ defmodule BatchServing do
   end
 
   @doc """
-  Starts a `Serving` process to batch requests to a given serving.
+  Starts a `BatchServing` process to batch requests for a given serving.
 
   ## Options
 
@@ -441,15 +444,11 @@ defmodule BatchServing do
 
     * `:name` - an atom with the name of the process
 
-    * `:serving` - a `Serving` struct with the serving configuration
-
-    * `:batch_keys` - all available batch keys. Batch keys allows Serving
-      to accumulate different batches with different properties. Defaults to
-      `[:default]`
+    * `:serving` - a `BatchServing` struct with the serving configuration
 
     * `:batch_size` - the maximum batch size. A default value can be set with
-      `batch_size/2`, which applies to both `run/2` and `batched_run/2`.
-      Setting this option only affects `batched_run/2` and it defaults to `1`
+      `batch_size/2`, which applies to both `inline/2` and `dispatch/2`.
+      Setting this option only affects `dispatch/2` and it defaults to `1`
       if none is set.
 
     * `:batch_timeout` - the maximum time to wait, in milliseconds,
@@ -483,13 +482,12 @@ defmodule BatchServing do
 
     shutdown = Keyword.get(opts, :shutdown, 30_000)
     partitions = Keyword.get(opts, :partitions, 1)
-    batch_keys = Keyword.get(opts, :batch_keys, [:default])
     batch_timeout = Keyword.get(opts, :batch_timeout, 100)
     process_options = Keyword.take(opts, [:name, :hibernate_after, :spawn_opt])
 
     supervisor = Module.concat(name, "Supervisor")
     task_supervisor = Module.concat(name, "TaskSupervisor")
-    arg = {name, serving, partitions, batch_keys, batch_size, batch_timeout, task_supervisor}
+    arg = {name, serving, partitions, batch_size, batch_timeout, task_supervisor}
 
     children = [
       {Task.Supervisor, name: task_supervisor},
@@ -504,57 +502,114 @@ defmodule BatchServing do
   end
 
   @doc """
-  Runs the given `input` on the serving process given by `name`.
-
-  `name` may be a local name (`:my_serving`) or explicit routing tuple:
-  `{:local, name}` or `{:distributed, name}`.
+  Runs a single item on the serving process given by `name`.
   """
-  def batched_run(name, input, distributed_preprocessing \\ &Function.identity/1)
+  def dispatch(name, input, distributed_preprocessing \\ &Function.identity/1)
 
-  def batched_run(name, input, distributed_preprocessing) when is_atom(name) do
-    if pid = Process.whereis(name) do
-      local_batched_run!(pid, name, input)
-    else
-      distributed_batched_run!(name, input, distributed_preprocessing)
-    end
+  def dispatch(name, input, distributed_preprocessing)
+      when is_atom(name) and not is_list(input) do
+    [v] =
+      if pid = Process.whereis(name) do
+        local_batched_run!(pid, name, input, :single)
+      else
+        distributed_batched_run!(name, input, distributed_preprocessing, :single)
+      end
+
+    v
   end
 
-  def batched_run({:local, name}, input, _distributed_preprocessing) when is_atom(name) do
+  def dispatch(name, _input, _distributed_preprocessing) when is_atom(name) do
+    raise ArgumentError,
+          "dispatch/3 accepts a single item; use dispatch_many/3 for explicit batches"
+  end
+
+  def dispatch({:local, name}, input, _distributed_preprocessing)
+      when is_atom(name) and not is_list(input) do
     pid =
       Process.whereis(name) || exit({:noproc, {__MODULE__, :local_batched_run, [name, input]}})
 
-    local_batched_run!(pid, name, input)
+    [v] = local_batched_run!(pid, name, input, :single)
+    v
   end
 
-  def batched_run({:distributed, name}, input, distributed_preprocessing) when is_atom(name) do
-    distributed_batched_run!(name, input, distributed_preprocessing)
+  def dispatch({:local, _name}, _input, _distributed_preprocessing) do
+    raise ArgumentError,
+          "dispatch/3 accepts a single item; use dispatch_many/3 for explicit batches"
+  end
+
+  def dispatch({:distributed, name}, input, distributed_preprocessing)
+      when is_atom(name) and not is_list(input) do
+    [v] = distributed_batched_run!(name, input, distributed_preprocessing, :single)
+    v
+  end
+
+  def dispatch({:distributed, _name}, _input, _distributed_preprocessing) do
+    raise ArgumentError,
+          "dispatch/3 accepts a single item; use dispatch_many/3 for explicit batches"
   end
 
   @doc """
-  Safe variant of `batched_run/3` that does not exit on runtime failures.
+  Runs explicit batch input on the serving process given by `name`.
+  """
+  def dispatch_many(name, batch_input, distributed_preprocessing \\ &Function.identity/1)
+
+  def dispatch_many(name, batch_input, distributed_preprocessing) when is_atom(name) do
+    if pid = Process.whereis(name) do
+      local_batched_run!(pid, name, batch_input, :batch)
+    else
+      distributed_batched_run!(name, batch_input, distributed_preprocessing, :batch)
+    end
+  end
+
+  def dispatch_many({:local, name}, batch_input, _distributed_preprocessing)
+      when is_atom(name) do
+    pid =
+      Process.whereis(name) ||
+        exit({:noproc, {__MODULE__, :local_batched_run_batch, [name, batch_input]}})
+
+    local_batched_run!(pid, name, batch_input, :batch)
+  end
+
+  def dispatch_many({:distributed, name}, batch_input, distributed_preprocessing)
+      when is_atom(name) do
+    distributed_batched_run!(name, batch_input, distributed_preprocessing, :batch)
+  end
+
+  @doc """
+  Safe variant of `dispatch/3` that does not exit on runtime failures.
 
   Returns `{:ok, result}` or `{:error, reason}`.
   """
-  def batched_run_safe(name, input, distributed_preprocessing \\ &Function.identity/1) do
-    {:ok, batched_run(name, input, distributed_preprocessing)}
+  def dispatch_safe(name, input, distributed_preprocessing \\ &Function.identity/1) do
+    {:ok, dispatch(name, input, distributed_preprocessing)}
   catch
     :exit, reason -> {:error, reason}
   end
 
-  defp local_batched_run!(pid, name, input) do
-    case local_batched_run(pid, name, input) do
+  @doc """
+  Safe variant of `dispatch_many/3` that does not exit on runtime failures.
+
+  Returns `{:ok, result}` or `{:error, reason}`.
+  """
+  def dispatch_many_safe(name, batch_input, distributed_preprocessing \\ &Function.identity/1) do
+    {:ok, dispatch_many(name, batch_input, distributed_preprocessing)}
+  catch
+    :exit, reason -> {:error, reason}
+  end
+
+  defp local_batched_run!(pid, name, input, mode) do
+    case local_batched_run(pid, name, input, mode) do
       {:ok, result} -> result
       {:DOWN, reason} -> exit({reason, {__MODULE__, :local_batched_run, [name, input]}})
     end
   end
 
-  defp local_batched_run(pid, name, input) do
+  defp local_batched_run(pid, name, input, input_mode) do
     %{
       preprocessing: preprocessing,
       postprocessing: postprocessing,
       limit: limit,
-      mode: mode,
-      batch_keys: batch_keys
+      mode: serving_mode
     } =
       :persistent_term.get(persistent_key(name), nil) ||
         raise(
@@ -563,7 +618,7 @@ defmodule BatchServing do
             "Make sure your BatchServing is running and/or started as part of your supervision tree"
         )
 
-    preprocessed = handle_preprocessing(preprocessing, input)
+    preprocessed = handle_preprocessing(preprocessing, input, input_mode)
 
     ref = :erlang.monitor(:process, pid, alias: :demonitor)
     # ref = Process.monitor(pid, alias: :demonitor)
@@ -571,19 +626,22 @@ defmodule BatchServing do
     size_or_unknown =
       case preprocessed do
         %BatchServing.Batch{size: size} = batch ->
-          if mode == :hooks and batch.size > limit do
-            raise ArgumentError,
-                  "batch size (#{batch.size}) cannot exceed BatchServing server batch size of #{limit} when streaming hooks"
+          if serving_mode == :hooks and batch.size > limit do
+            batch
+            |> run_batch_or_stream(limit)
+            |> Enum.each(fn split_batch ->
+              Process.send(pid, {__MODULE__, :dispatch, [ref], split_batch}, [:noconnect])
+            end)
+          else
+            Process.send(pid, {__MODULE__, :dispatch, [ref], batch}, [:noconnect])
           end
 
-          validate_batch_key!(batch, batch_keys)
-          Process.send(pid, {__MODULE__, :batched_run, [ref], batch}, [:noconnect])
           size
 
         stream ->
-          if mode == :hooks do
+          if serving_mode == :hooks do
             raise ArgumentError,
-                  "streaming hooks do not support input streaming; map_input must produce a single value list"
+                  "streaming hooks do not support input streaming; map_inputs must produce a single value list"
           end
 
           spawn_link(fn ->
@@ -592,27 +650,25 @@ defmodule BatchServing do
             Process.send(pid, {__MODULE__, :proxy_monitor, self(), ref}, [:noconnect])
             monitor_ref = Process.monitor(pid)
 
-            acc =
+            pending =
               Enum.reduce(stream, 0, fn
                 %BatchServing.Batch{size: size} = batch, acc when size <= limit ->
-                  receive_size(monitor_ref, ref, acc)
-                  validate_batch_key!(batch, batch_keys)
                   refs = [ref, self()]
-                  Process.send(pid, {__MODULE__, :batched_run, refs, batch}, [:noconnect])
-                  size
+                  Process.send(pid, {__MODULE__, :dispatch, refs, batch}, [:noconnect])
+                  acc + size
 
                 other, _acc ->
                   raise "mapped input produced an invalid batch of maximum size #{limit}, " <>
                           "got: #{inspect(other)}"
               end)
 
-            receive_size(monitor_ref, ref, acc)
+            receive_size(monitor_ref, ref, pending)
           end)
 
           :unknown
       end
 
-    case mode do
+    case serving_mode do
       :execute ->
         case receive_execute(ref, size_or_unknown) do
           {:ok, value} ->
@@ -623,27 +679,20 @@ defmodule BatchServing do
         end
 
       _ ->
-        stream = receive_stream("batched_run/2", ref, size_or_unknown)
+        stream = receive_stream("dispatch/2", ref, size_or_unknown)
         {:ok, handle_postprocessing(postprocessing, stream)}
     end
   end
 
-  defp validate_batch_key!(batch, batch_keys) do
-    unless is_map_key(batch_keys, batch.key) do
-      raise ArgumentError,
-            "unknown batch key: #{inspect(batch.key)} (expected one of #{inspect(Map.keys(batch_keys))})"
-    end
+  defp distributed_batched_run!(name, input, distributed_callback, mode) do
+    distributed_batched_run_with_retries!(name, distributed_callback.(input), 3, mode)
   end
 
-  defp distributed_batched_run!(name, input, distributed_callback) do
-    distributed_batched_run_with_retries!(name, distributed_callback.(input), 3)
-  end
-
-  defp distributed_batched_run_with_retries!(name, input, 0) do
+  defp distributed_batched_run_with_retries!(name, input, 0, _mode) do
     exit({:noproc, {__MODULE__, :distributed_batched_run, [name, input, [retries: 0]]}})
   end
 
-  defp distributed_batched_run_with_retries!(name, input, retries) do
+  defp distributed_batched_run_with_retries!(name, input, retries, mode) do
     case :pg.get_members(BatchServing.PG, __MODULE__) do
       [] ->
         exit({:noproc, {__MODULE__, :distributed_batched_run, [name, input, [retries: retries]]}})
@@ -651,7 +700,7 @@ defmodule BatchServing do
       entries ->
         pid = Enum.random(entries)
         ref = make_ref()
-        args = [self(), ref, name, input]
+        args = [self(), ref, name, input, mode]
 
         {_, monitor_ref} =
           Node.spawn_monitor(node(pid), __MODULE__, :__distributed_batched_run__, args)
@@ -663,7 +712,7 @@ defmodule BatchServing do
             Stream.resource(
               fn ->
                 if self() != owner do
-                  raise "the stream returned from BatchServing.batched_run/2 must be consumed in the same process"
+                  raise "the stream returned from BatchServing.dispatch/2 must be consumed in the same process"
                 end
 
                 :ok
@@ -687,7 +736,7 @@ defmodule BatchServing do
             result
 
           {:DOWN, ^monitor_ref, _, _, :noproc} ->
-            distributed_batched_run_with_retries!(name, input, retries - 1)
+            distributed_batched_run_with_retries!(name, input, retries - 1, mode)
 
           {:DOWN, ^monitor_ref, _, _, reason} ->
             exit_args = [name, input, [retries: retries]]
@@ -697,10 +746,10 @@ defmodule BatchServing do
   end
 
   @doc false
-  def __distributed_batched_run__(client_pid, ref, name, input) do
+  def __distributed_batched_run__(client_pid, ref, name, input, mode) do
     pid = Process.whereis(name) || exit(:noproc)
 
-    case local_batched_run(pid, name, input) do
+    case local_batched_run(pid, name, input, mode) do
       {:ok, result} ->
         %{mode: mode, distributed_postprocessing: dist_post} =
           :persistent_term.get(persistent_key(name))
@@ -831,38 +880,34 @@ defmodule BatchServing do
   require Logger
   @behaviour GenServer
 
+  @single_stack_key {__MODULE__, :stack}
   @empty_stack {[], 0, :none}
   @empty_queue :queue.new()
-  @timeout_message {__MODULE__, :timeout}
+  @timeout_message __MODULE__
 
   @impl true
-  def init({name, serving, partitions, batch_keys, batch_size, batch_timeout, task_supervisor}) do
+  def init({name, serving, partitions, batch_size, batch_timeout, task_supervisor}) do
     Process.flag(:trap_exit, true)
     partitions_opts = serving_partitions(serving, partitions)
 
     partitions_count = length(partitions_opts)
 
     {mode, partitions_opts, hooks_table} = serving_streaming(serving, partitions_opts)
-    partitions_opts = Enum.map(partitions_opts, &Keyword.put(&1, :batch_keys, batch_keys))
     {:ok, module_state} = handle_init(serving.module, :process, serving.arg, partitions_opts)
 
     :persistent_term.put(
       persistent_key(name),
       %{
         limit: batch_size,
-        preprocessing: serving.map_input,
-        postprocessing: serving.map_result,
+        preprocessing: serving.map_inputs,
+        postprocessing: serving.map_results,
         distributed_postprocessing: serving.distributed_postprocessing,
-        mode: mode,
-        batch_keys: Map.from_keys(batch_keys, [])
+        mode: mode
       }
     )
 
     :pg.join(BatchServing.PG, __MODULE__, List.duplicate(self(), partitions_count))
-
-    for batch_key <- batch_keys do
-      stack_init(batch_key)
-    end
+    stack_init()
 
     # We keep batches in a stack. Once the stack is full
     # or it times out, we either execute or enqueue it.
@@ -874,7 +919,7 @@ defmodule BatchServing do
       in_queue: @empty_queue,
       out_queue: Enum.reduce(0..(partitions_count - 1), :queue.new(), &:queue.in/2),
       tasks: [],
-      pending_batches: Map.from_keys(batch_keys, @empty_queue),
+      pending_batches: @empty_queue,
       task_supervisor: task_supervisor,
       hooks_table: hooks_table
     }
@@ -922,9 +967,9 @@ defmodule BatchServing do
     {:noreply, state}
   end
 
-  def handle_info({__MODULE__, :batched_run, refs, %BatchServing.Batch{key: key} = batch}, state) do
+  def handle_info({__MODULE__, :dispatch, refs, %BatchServing.Batch{} = batch}, state) do
     %{limit: limit} = state
-    count = stack_count(key)
+    count = stack_count()
 
     state =
       cond do
@@ -932,37 +977,37 @@ defmodule BatchServing do
         # Execute what we have (if any) and execute a new one.
         batch.size == limit ->
           state
-          |> server_execute(key)
-          |> server_stack(key, refs, batch, :skip_timer)
-          |> server_execute(key)
+          |> server_execute()
+          |> server_stack(refs, batch, :skip_timer)
+          |> server_execute()
 
         # We go over the limit, but if using hooks, we can't split.
         batch.size + count > limit and state.hooks_table != nil ->
           state
-          |> server_execute(key)
-          |> server_stack(key, refs, batch, :set_timer)
+          |> server_execute()
+          |> server_stack(refs, batch, :set_timer)
 
         # Split as necessary.
         true ->
-          server_stack_and_execute_loop(state, batch, count, key, refs)
+          server_stack_and_execute_loop(state, batch, count, refs)
       end
 
     {:noreply, state}
   end
 
-  def handle_info({@timeout_message, key, ref}, %{out_queue: out_queue} = state) do
-    case stack_timer(key) do
+  def handle_info({@timeout_message, :timeout, ref}, %{out_queue: out_queue} = state) do
+    case stack_timer() do
       # We have processing power, so execute it immediately.
       {^ref, _timer_ref} when out_queue != @empty_queue ->
-        {:noreply, server_execute(state, key)}
+        {:noreply, server_execute(state)}
 
       # Otherwise we will queue it but keep on increasing the batch.
       {^ref, _timer_ref} ->
-        stack_update(key, fn {[_ | _] = stack, count, _timer} ->
+        stack_update(fn {[_ | _] = stack, count, _timer} ->
           {stack, count, :done}
         end)
 
-        {:noreply, update_in(state.in_queue, &:queue.in(key, &1))}
+        {:noreply, update_in(state.in_queue, &:queue.in(:pending, &1))}
 
       # Otherwise this is an old timer message, just ignore it.
       _ ->
@@ -1009,16 +1054,14 @@ defmodule BatchServing do
 
   @impl true
   def terminate(_reason, %{tasks: tasks, pending_batches: pending_batches}) do
-    for {batch_key, queue} <- pending_batches do
-      # Emulate the process is gone for entries in the queue
-      for {_batch, ref_sizes} <- :queue.to_list(queue) do
-        server_reply_down(:noproc, ref_sizes)
-      end
+    # Emulate the process is gone for entries in the queue.
+    for {_batch, ref_sizes} <- :queue.to_list(pending_batches) do
+      server_reply_down(:noproc, ref_sizes)
+    end
 
-      # As well as for entries in the stack
-      for {[ref | _pids], _batch} <- stack_entries(batch_key) do
-        send(ref, {:DOWN, ref, :process, self(), :noproc})
-      end
+    # As well as for entries in the stack.
+    for {[ref | _pids], _batch} <- stack_entries() do
+      send(ref, {:DOWN, ref, :process, self(), :noproc})
     end
 
     # And wait until all current tasks are processed
@@ -1046,35 +1089,35 @@ defmodule BatchServing do
     end
   end
 
-  defp server_stack_and_execute_loop(state, batch, count, key, refs) do
+  defp server_stack_and_execute_loop(state, batch, count, refs) do
     %{limit: limit} = state
     %{size: size} = batch
 
     cond do
       size + count < limit ->
-        server_stack(state, key, refs, batch, :set_timer)
+        server_stack(state, refs, batch, :set_timer)
 
       size + count > limit ->
         {current, batch} = BatchServing.Batch.split(batch, limit - count)
 
         state
-        |> server_stack(key, refs, current, :skip_timer)
-        |> server_execute(key)
-        |> server_stack_and_execute_loop(batch, 0, key, refs)
+        |> server_stack(refs, current, :skip_timer)
+        |> server_execute()
+        |> server_stack_and_execute_loop(batch, 0, refs)
 
       true ->
         state
-        |> server_stack(key, refs, batch, :skip_timer)
-        |> server_execute(key)
+        |> server_stack(refs, batch, :skip_timer)
+        |> server_execute()
     end
   end
 
-  defp server_stack(%{limit: limit} = state, key, refs, batch, timer_mode) do
-    stack_update(key, fn {stack, count, timer} when batch.size + count <= limit ->
+  defp server_stack(%{limit: limit} = state, refs, batch, timer_mode) do
+    stack_update(fn {stack, count, timer} when batch.size + count <= limit ->
       timer =
         if timer == :none and timer_mode == :set_timer do
           ref = make_ref()
-          {ref, Process.send_after(self(), {@timeout_message, key, ref}, state.timeout)}
+          {ref, Process.send_after(self(), {@timeout_message, :timeout, ref}, state.timeout)}
         else
           timer
         end
@@ -1085,18 +1128,18 @@ defmodule BatchServing do
     state
   end
 
-  defp server_execute(state, key) do
-    if stack_count(key) == 0 do
+  defp server_execute(state) do
+    if stack_count() == 0 do
       state
     else
-      {batch_refs, timer} = stack_to_batch_refs(key)
-      state = update_in(state.pending_batches[key], &:queue.in(batch_refs, &1))
+      {batch_refs, timer} = stack_to_batch_refs()
+      state = update_in(state.pending_batches, &:queue.in(batch_refs, &1))
 
       state =
         if timer == :done do
           state
         else
-          update_in(state.in_queue, &:queue.in(key, &1))
+          update_in(state.in_queue, &:queue.in(:pending, &1))
         end
 
       server_maybe_task(state)
@@ -1107,16 +1150,16 @@ defmodule BatchServing do
     %{out_queue: out_queue, in_queue: in_queue, pending_batches: pending_batches} = state
 
     with {{:value, partition}, out_queue} <- :queue.out(out_queue),
-         {{:value, key}, in_queue} <- :queue.out(in_queue) do
+         {{:value, :pending}, in_queue} <- :queue.out(in_queue) do
       {{batch, ref_sizes}, pending_batches} =
-        case :queue.out(pending_batches[key]) do
+        case :queue.out(pending_batches) do
           {:empty, _pending_batches} ->
             # If there is no entry pending, then we have a timed-out in-construction batch.
-            {batch_refs, :done} = stack_to_batch_refs(key)
+            {batch_refs, :done} = stack_to_batch_refs()
             {batch_refs, pending_batches}
 
           {{:value, batch_refs}, queue} ->
-            {batch_refs, Map.put(pending_batches, key, queue)}
+            {batch_refs, queue}
         end
 
       %{module: module, module_state: module_state, hooks_table: hooks_table} = state
@@ -1160,43 +1203,41 @@ defmodule BatchServing do
 
   ## Stack management
   #
-  # The stack is stored in the process dictionary for performance
-  # since the common case does not use any batch key.
-
-  defp stack_init(key) do
-    Process.put({__MODULE__, key}, @empty_stack)
+  # The stack is stored in the process dictionary for performance.
+  defp stack_init do
+    Process.put(@single_stack_key, @empty_stack)
     :ok
   end
 
-  defp stack_count(key) do
-    {_stack, count, _timer} = Process.get({__MODULE__, key})
+  defp stack_count do
+    {_stack, count, _timer} = Process.get(@single_stack_key)
     count
   end
 
-  defp stack_timer(key) do
-    {_stack, _count, timer} = Process.get({__MODULE__, key})
+  defp stack_timer do
+    {_stack, _count, timer} = Process.get(@single_stack_key)
     timer
   end
 
-  defp stack_entries(key) do
-    {stack, _count, _timer} = Process.get({__MODULE__, key})
+  defp stack_entries do
+    {stack, _count, _timer} = Process.get(@single_stack_key)
     stack
   end
 
-  defp stack_update(key, fun) do
-    Process.put({__MODULE__, key}, fun.(Process.get({__MODULE__, key})))
+  defp stack_update(fun) do
+    Process.put(@single_stack_key, fun.(Process.get(@single_stack_key)))
     :ok
   end
 
-  defp stack_to_batch_refs(key) do
-    {[_ | _] = stack, count, timer} = Process.get({__MODULE__, key})
-    :ok = stack_init(key)
+  defp stack_to_batch_refs do
+    {[_ | _] = stack, count, timer} = Process.get(@single_stack_key)
+    :ok = stack_init()
 
     with {ref, timer_ref} <- timer do
       Process.cancel_timer(timer_ref)
 
       receive do
-        {@timeout_message, ^key, ^ref} -> :ok
+        {@timeout_message, :timeout, ^ref} -> :ok
       after
         0 -> :ok
       end
@@ -1241,69 +1282,49 @@ defmodule BatchServing do
 
   defp handle_executed(_module, result), do: result
 
-  defp handle_preprocessing(nil, input) do
-    mapped =
-      cond do
-        is_list(input) -> input
-        Enumerable.impl_for(input) -> input
-        true -> [input]
-      end
-
-    mapped_to_batch_or_stream(mapped)
+  defp handle_preprocessing(preprocessing, input, :single) do
+    handle_preprocessing(preprocessing, [input], :batch)
   end
 
-  defp handle_preprocessing(preprocessing, input) do
+  defp handle_preprocessing(nil, batch_input, :batch) do
+    mapped_to_batch_or_stream(batch_input)
+  end
+
+  defp handle_preprocessing(preprocessing, input, _mode) do
     meta = %{input: input}
 
     :telemetry.span([:batch_serving, :serving, :preprocessing], meta, fn ->
       mapped = preprocessing.(input)
 
       batch_or_stream =
-        mapped_to_batch_or_stream(mapped) || raise_bad_map_input!(preprocessing, mapped)
+        mapped_to_batch_or_stream(mapped) || raise_bad_map_inputs!(preprocessing, mapped)
 
       {batch_or_stream, meta}
     end)
   end
 
-  defp raise_bad_map_input!(preprocessing, result) do
-    raise "map_input function #{inspect(preprocessing)} must return a list of values, " <>
-            "{batch_key, list_of_values}, or a stream of those. Got: #{inspect(result)}"
-  end
-
-  defp mapped_to_batch_or_stream({key, values}) when is_list(values) do
-    mapped_entry_to_batch!({key, values})
+  defp raise_bad_map_inputs!(preprocessing, result) do
+    raise "map_inputs function #{inspect(preprocessing)} must return a list of values, " <>
+            "or a stream of values. Got: #{inspect(result)}"
   end
 
   defp mapped_to_batch_or_stream(values) when is_list(values) do
-    if values != [] and Enum.all?(values, &mapped_entry?/1) do
-      Stream.map(values, &mapped_entry_to_batch!/1)
-    else
-      mapped_entry_to_batch!(values)
-    end
+    mapped_list_to_batch!(values)
   end
 
   defp mapped_to_batch_or_stream(stream) do
     if Enumerable.impl_for(stream) do
-      Stream.map(stream, &mapped_entry_to_batch!/1)
+      Stream.map(stream, &mapped_stream_entry_to_batch/1)
     end
   end
 
-  defp mapped_entry?({_, values}) when is_list(values), do: true
-  defp mapped_entry?(values) when is_list(values), do: true
-  defp mapped_entry?(_), do: false
-
-  defp mapped_entry_to_batch!({key, values}) when is_list(values) do
-    if values == [], do: raise(ArgumentError, "cannot run with empty value list")
-    BatchServing.Batch.values(values) |> BatchServing.Batch.key(key)
-  end
-
-  defp mapped_entry_to_batch!(values) when is_list(values) do
-    if values == [], do: raise(ArgumentError, "cannot run with empty value list")
+  defp mapped_list_to_batch!(values) when is_list(values) do
+    if values == [], do: raise(ArgumentError, "cannot inline with empty value list")
     BatchServing.Batch.values(values)
   end
 
-  defp mapped_entry_to_batch!(other) do
-    raise "map_input entries must be lists or {batch_key, list} entries, got: #{inspect(other)}"
+  defp mapped_stream_entry_to_batch(value) do
+    BatchServing.Batch.values([value])
   end
 
   defp handle_postprocessing(nil, result), do: result
@@ -1323,22 +1344,8 @@ defmodule BatchServing.Default do
   def init(_type, fun, partitions) do
     batch_funs =
       Enum.with_index(partitions, fn runtime_options, index ->
-        value =
-          cond do
-            is_function(fun, 1) ->
-              fn batch -> fun.(batch.values) end
-
-            is_function(fun, 2) ->
-              {batch_keys, _} = Keyword.pop!(runtime_options, :batch_keys)
-
-              for batch_key <- batch_keys,
-                  into: %{},
-                  do:
-                    {batch_key,
-                     fn batch ->
-                       fun.(batch_key, batch.values)
-                     end}
-          end
+        _ = runtime_options
+        value = fn batch -> fun.(batch.values) end
 
         {index, value}
       end)
@@ -1348,11 +1355,7 @@ defmodule BatchServing.Default do
 
   @impl true
   def handle_batch(batch, partition, batch_funs) do
-    batch_fun =
-      case batch_funs do
-        %{^partition => batch_keys} when is_map(batch_keys) -> Map.fetch!(batch_keys, batch.key)
-        %{^partition => fun} -> fun
-      end
+    batch_fun = Map.fetch!(batch_funs, partition)
 
     {:execute, fn -> batch_fun.(batch) end, batch_funs}
   end

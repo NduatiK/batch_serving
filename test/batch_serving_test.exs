@@ -2,41 +2,121 @@ defmodule BatchServingTest do
   use ExUnit.Case
 
   def square_values(values), do: Enum.map(values, &(&1 * &1))
+  def square_serving(), do: BatchServing.new(&square_values/1)
 
   describe "inline" do
-    test "simple inline" do
-      serving = BatchServing.new(&square_values/1)
-      assert [1, 4, 9, 16] == BatchServing.run(serving, [1, 2, 3, 4])
+    test "simple inline one" do
+      assert 4 == BatchServing.inline(square_serving(), 2)
+    end
+
+    test "simple inline many" do
+      assert [1, 4, 9, 16] == BatchServing.inline_many(square_serving(), [1, 2, 3, 4])
+    end
+
+    test "simple inline many with stream" do
+      input_stream = Stream.map([1, 2, 3, 4], & &1)
+
+      assert [[1], [4], [9], [16]] ==
+               BatchServing.inline_many(square_serving(), input_stream)
+    end
+
+    test "input/result mapping inline single" do
+      serving =
+        square_serving()
+        |> BatchServing.map_inputs(fn input -> input end)
+        |> BatchServing.map_results(&Enum.map(&1, fn x -> "#{x}" end))
+
+      assert "4" == BatchServing.inline(serving, 2)
     end
 
     test "input/result mapping inline" do
       serving =
-        BatchServing.new(&square_values/1)
-        |> BatchServing.map_input(fn input -> input end)
-        |> BatchServing.map_result(fn output -> {:ok, output} end)
+        square_serving()
+        |> BatchServing.map_inputs(fn input -> input end)
+        |> BatchServing.map_results(&Enum.map(&1, fn x -> "#{x}" end))
 
-      assert {:ok, [1, 4, 9, 16]} == BatchServing.run(serving, [1, 2, 3, 4])
+      assert ["1", "4", "9", "16"] == BatchServing.inline_many(serving, [1, 2, 3, 4])
     end
   end
 
   describe "serving process" do
-    test "batched run" do
+    test "dispatch single" do
       {:ok, _pid} =
         start_supervised(%{id: BatchServing.PG, start: {:pg, :start_link, [BatchServing.PG]}})
 
       {:ok, _pid} =
         start_supervised(
           {BatchServing,
-           serving: BatchServing.new(fn values -> Enum.map(values, &(&1 * &1)) end),
-           name: MyServing,
-           batch_size: 10,
-           batch_timeout: 100}
+           [
+             serving: square_serving(),
+             name: MyServing,
+             batch_size: 10,
+             batch_timeout: 100
+           ]}
         )
 
-      assert [1, 4, 9, 16, 25] == BatchServing.batched_run(MyServing, [[1, 2, 3], [4, 5]])
+      assert 4 == BatchServing.dispatch(MyServing, 2)
     end
 
-    test "batched run with stream" do
+    test "dispatch many" do
+      {:ok, _pid} =
+        start_supervised(%{id: BatchServing.PG, start: {:pg, :start_link, [BatchServing.PG]}})
+
+      {:ok, _pid} =
+        start_supervised(
+          {BatchServing,
+           [
+             serving: square_serving(),
+             name: MyServing,
+             batch_size: 10,
+             batch_timeout: 100
+           ]}
+        )
+
+      assert [1, 4, 9, 16, 25] == BatchServing.dispatch_many(MyServing, [1, 2, 3, 4, 5])
+    end
+
+    test "dispatch many mini example with stream" do
+      {:ok, _pid} =
+        start_supervised(%{id: BatchServing.PG, start: {:pg, :start_link, [BatchServing.PG]}})
+
+      {:ok, _pid} =
+        start_supervised(
+          {BatchServing,
+           [
+             serving: square_serving(),
+             name: StreamServing,
+             batch_size: 10,
+             batch_timeout: 100
+           ]}
+        )
+
+      input_stream = Stream.map([1, 2, 3], & &1)
+
+      assert [1, 4, 9] == BatchServing.dispatch_many(StreamServing, input_stream)
+    end
+
+    test "dispatch many stream treats each streamed list as one item" do
+      {:ok, _pid} =
+        start_supervised(%{id: BatchServing.PG, start: {:pg, :start_link, [BatchServing.PG]}})
+
+      {:ok, _pid} =
+        start_supervised(
+          {BatchServing,
+           [
+             serving: BatchServing.new(fn values -> Enum.map(values, &Enum.sum/1) end),
+             name: StreamItemServing,
+             batch_size: 2,
+             batch_timeout: 100
+           ]}
+        )
+
+      input_stream = Stream.map([[1, 2], [3]], & &1)
+
+      assert [3, 3] == BatchServing.dispatch_many(StreamItemServing, input_stream)
+    end
+
+    test "dispatch many with stream" do
       {:ok, _pid} =
         start_supervised(%{id: BatchServing.PG, start: {:pg, :start_link, [BatchServing.PG]}})
 
@@ -47,10 +127,9 @@ defmodule BatchServingTest do
              BatchServing.new(fn values ->
                Enum.map(values, &(&1 * &1))
              end)
-             |> BatchServing.map_input(fn input ->
+             |> BatchServing.map_inputs(fn input ->
                input
                |> List.wrap()
-               |> Enum.chunk_every(2)
                |> Stream.map(& &1)
              end),
            name: MyServing,
@@ -63,7 +142,7 @@ defmodule BatchServingTest do
                  1..4,
                  fn _ ->
                    data = [1, 2, 3]
-                   BatchServing.batched_run(MyServing, data)
+                   BatchServing.dispatch_many(MyServing, data)
                  end,
                  max_concurrency: 2
                )
@@ -71,7 +150,7 @@ defmodule BatchServingTest do
                |> Enum.to_list()
     end
 
-    test "batched run with stream(2)" do
+    test "dispatch single with coalescing" do
       {:ok, _pid} =
         start_supervised(%{id: BatchServing.PG, start: {:pg, :start_link, [BatchServing.PG]}})
 
@@ -87,35 +166,84 @@ defmodule BatchServingTest do
            batch_timeout: 100}
         )
 
-      submit_work = fn num ->
-        hd(BatchServing.batched_run(MyServing, [num]))
+      run_work = fn num, duration_range ->
+        started_at = System.monotonic_time(:millisecond)
+
+        assert square_values(1..num) ==
+                 1..num
+                 |> Task.async_stream(
+                   fn num ->
+                     BatchServing.dispatch(MyServing, num)
+                   end,
+                   max_concurrency: 4
+                 )
+                 |> Enum.map(fn {:ok, results} -> results end)
+                 |> Enum.to_list()
+
+        total_latency = System.monotonic_time(:millisecond) - started_at
+        assert total_latency in duration_range
       end
 
-      assert [_, _, _, _, _, _] =
-               Task.async_stream(
-                 1..6,
-                 fn num ->
-                   submit_work.(num)
-                 end,
-                 max_concurrency: 4
-               )
-               |> Enum.map(fn {:ok, results} -> results end)
-               |> Enum.to_list()
+      # 5 numbers were processed in 3 batches, 1 batch had to wait before executing
+      assert run_work.(5, 101..120)
+
+      # 6 numbers were processed in 3 batches that were immediately filled
+      assert run_work.(6, 0..10)
     end
 
-    test "keys" do
-      serving =
-        BatchServing.new(fn
-          :double, values -> Enum.map(values, fn v -> v * 2 end)
-          :half, values -> Enum.map(values, fn v -> v / 2 end)
+    test "streaming returns first batch before full completion" do
+      {:ok, _pid} =
+        start_supervised(%{id: BatchServing.PG, start: {:pg, :start_link, [BatchServing.PG]}})
+
+      {:ok, _pid} =
+        start_supervised(
+          {BatchServing,
+           serving:
+             BatchServing.new(fn values ->
+               :timer.sleep(200)
+               square_values(values)
+             end)
+             |> BatchServing.streaming(),
+           name: EarlyStreamServing,
+           batch_size: 2,
+           batch_timeout: 50}
+        )
+
+      started_at = System.monotonic_time(:millisecond)
+
+      {events, first_event_latency} =
+        BatchServing.dispatch_many(EarlyStreamServing, [1, 2, 3, 4])
+        |> Enum.reduce({[], nil}, fn event, {acc, first_latency} ->
+          current_latency = System.monotonic_time(:millisecond) - started_at
+          {[event | acc], first_latency || current_latency}
         end)
-        |> BatchServing.map_input(fn {key, values} -> {key, values} end)
 
-      assert [0, 2, 4, 6, 8, 10, 12, 14, 16, 18] ==
-               BatchServing.run(serving, {:double, [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]})
+      total_latency = System.monotonic_time(:millisecond) - started_at
+      events = Enum.reverse(events)
 
-      assert [0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5] ==
-               BatchServing.run(serving, {:half, [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]})
+      assert events == [{:batch, [1, 4]}, {:batch, [9, 16]}]
+      assert first_event_latency >= 150
+      assert first_event_latency < total_latency
+      assert total_latency >= 350
+    end
+
+    test "map_inputs can transform structured input" do
+      serving =
+        square_serving()
+        |> BatchServing.map_inputs(fn values -> Enum.map(values, & &1.number) end)
+
+      assert 4 == BatchServing.inline(serving, %{number: 2})
+      assert [4, 9] == BatchServing.inline_many(serving, [%{number: 2}, %{number: 3}])
+    end
+
+    test "inline_many must be called with a list or stream" do
+      serving =
+        square_serving()
+        |> BatchServing.map_inputs(fn values -> values end)
+
+      assert_raise FunctionClauseError, fn ->
+        BatchServing.inline_many(serving, %{numbers: [1, 2, 3]})
+      end
     end
 
     defmodule ServingModule do
@@ -145,7 +273,52 @@ defmodule BatchServingTest do
            batch_timeout: 100}
         )
 
-      assert [1, 4, 9, 16, 25] == BatchServing.batched_run(MyServing, [[1, 2, 3], [4, 5]])
+      assert [1, 4, 9, 16, 25] == BatchServing.dispatch_many(MyServing, [1, 2, 3, 4, 5])
+    end
+
+    defmodule HookStreamingModule do
+      @behaviour BatchServing
+
+      @impl true
+      def init(_inline_or_process, :ok, [options]) do
+        {:ok, %{hooks: Keyword.get(options, :hooks, %{})}}
+      end
+
+      @impl true
+      def handle_batch(%BatchServing.Batch{values: values}, 0, %{hooks: hooks} = state) do
+        {:execute,
+         fn ->
+           if hook_fun = hooks[:progress], do: hook_fun.(values)
+           Enum.map(values, &(&1 * 10))
+         end, state}
+      end
+    end
+
+    test "streaming with hooks emits hook events" do
+      {:ok, _pid} =
+        start_supervised(%{id: BatchServing.PG, start: {:pg, :start_link, [BatchServing.PG]}})
+
+      {:ok, _pid} =
+        start_supervised(
+          {BatchServing,
+           serving:
+             BatchServing.new(HookStreamingModule, :ok)
+             |> BatchServing.streaming(hooks: [:progress]),
+           name: HookStreamServing,
+           batch_size: 3,
+           batch_timeout: 50}
+        )
+
+      events =
+        BatchServing.dispatch_many(HookStreamServing, [1, 2, 3, 4, 5])
+        |> Enum.to_list()
+
+      assert events == [
+               {:progress, [1, 2, 3]},
+               {:batch, [10, 20, 30]},
+               {:progress, [4, 5]},
+               {:batch, [40, 50]}
+             ]
     end
 
     test "partitions" do
@@ -172,7 +345,9 @@ defmodule BatchServingTest do
             1..4,
             fn i ->
               batch = [i, i + 1]
-              assert [i ** 2, (i + 1) ** 2] == BatchServing.batched_run(PartitionedServing, batch)
+
+              assert [i ** 2, (i + 1) ** 2] ==
+                       BatchServing.dispatch_many(PartitionedServing, batch)
             end,
             max_concurrency: 4
           )
@@ -184,24 +359,21 @@ defmodule BatchServingTest do
       assert time_in_seconds < 2.1
     end
 
-    test "batched_run_safe returns ok for successful requests" do
+    test "dispatch_safe returns ok for successful requests" do
       {:ok, _pid} =
         start_supervised(%{id: BatchServing.PG, start: {:pg, :start_link, [BatchServing.PG]}})
 
       {:ok, _pid} =
         start_supervised(
           {BatchServing,
-           serving: BatchServing.new(fn values -> Enum.map(values, &(&1 * &1)) end),
-           name: SafeServing,
-           batch_size: 10,
-           batch_timeout: 100}
+           serving: square_serving(), name: SafeServing, batch_size: 10, batch_timeout: 100}
         )
 
-      assert {:ok, [4, 9]} = BatchServing.batched_run_safe(SafeServing, [2, 3])
+      assert {:ok, [4, 9]} = BatchServing.dispatch_many_safe(SafeServing, [2, 3])
     end
 
-    test "batched_run_safe returns error for missing serving" do
-      assert {:error, _reason} = BatchServing.batched_run_safe({:local, MissingServing}, [1])
+    test "dispatch_safe returns error for missing serving" do
+      assert {:error, _reason} = BatchServing.dispatch_safe({:local, MissingServing}, 1)
     end
   end
 end

@@ -7,11 +7,12 @@ defmodule BatchServing.MixProject do
     [
       app: :batch_serving,
       description: "A serving for batch processing",
-      version: "0.1.5",
+      version: "1.0.0",
       elixir: "~> 1.14",
       start_permanent: Mix.env() == :prod,
       deps: deps(),
-      package: package()
+      package: package(),
+      docs: &docs/0
     ]
   end
 
@@ -38,5 +39,15 @@ defmodule BatchServing.MixProject do
         "GitHub" => @source_url
       }
     }
+  end
+
+  defp docs do
+    [
+      extras: [
+        "README.md",
+        "docs/hooks.livemd",
+        "docs/liveview_batch_progress_demo.livemd"
+      ]
+    ]
   end
 end

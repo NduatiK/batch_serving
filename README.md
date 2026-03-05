@@ -26,7 +26,7 @@ end
 
 1. Define a serving function that receives a list of values.
 2. Start a serving process with `batch_size` and `batch_timeout`.
-3. Call `BatchServing.batched_run/2` from many concurrent callers.
+3. Use `BatchServing.dispatch/2` for single items and `BatchServing.dispatch_many/2` for explicit batches.
 4. Calls close together in time are merged and executed once.
 
 ## Quick start
@@ -54,7 +54,7 @@ Supervisor.start_link(children, strategy: :one_for_one)
 ### 2) Submit work
 
 ```elixir
-BatchServing.batched_run(MyServing, [2, 3])
+BatchServing.dispatch_many(MyServing, [2, 3])
 #=> [4, 9]
 ```
 
@@ -62,7 +62,7 @@ From multiple concurrent callers:
 
 ```elixir
 Task.async_stream(1..20, fn n ->
-  hd(BatchServing.batched_run(MyServing, [n]))
+  BatchServing.dispatch(MyServing, n)
 end, max_concurrency: 20)
 |> Enum.to_list()
 ```
@@ -72,20 +72,61 @@ Each caller gets its own result, but execution is internally batched.
 ## API overview
 
 - `BatchServing.new/1` - Build a serving from a function.
-- `BatchServing.run/2` - Run inline in the current process (no cross-caller batching).
-- `BatchServing.batched_run/2` - Send work to a serving process for transparent batching.
-- `BatchServing.map_input/2` - Map complex input into value lists (or keyed value lists).
-- `BatchServing.map_result/2` - Map execution results into caller-facing shapes.
+
+- `BatchServing.map_inputs/2` - Map complex input into value lists.
+- `BatchServing.map_results/2` - Map execution results into caller-facing shapes.
+
+- `BatchServing.inline/2` - Run a single item inline.
+- `BatchServing.inline_many/2` - Run an explicit batch inline.
+- `BatchServing.dispatch/2` - Send a single item to a serving process for coalesced execution.
+- `BatchServing.dispatch_many/2` - Send an explicit batch to a serving process.
 
 ## Advanced options
 
 - `partitions: n` - Run multiple partitions for parallel batch execution.
-- `batch_keys: [...]` - Support distinct queues/functions under one serving name.
-- keyed batches through `map_input/2` by returning `{batch_key, values}`.
 - `streaming/2` - Stream batch results/events.
+
+## Hooks (Streaming Runtime Events)
+
+Hooks are useful when you need live runtime signals in addition to final batch output.
+
+When streaming is enabled:
+
+- `{:batch, output}` events carry result data.
+- hook events carry custom telemetry/progress data in the shape `{hook_name, payload}`.
+
+Example:
+
+```elixir
+serving =
+  BatchServing.new(MyServingModule, :ok)
+  |> BatchServing.streaming(hooks: [:progress])
+
+BatchServing.dispatch_many(MyServing, inputs)
+|> Enum.each(fn
+  {:progress, meta} -> IO.inspect(meta, label: "progress")
+  {:batch, output} -> IO.inspect(output, label: "batch")
+end)
+```
+
+Practical use case:
+
+- embeddings/indexing pipeline where users need live progress, latency, and cost updates while batches are running.
+
+Multi-user note:
+
+- if a single batch contains items from multiple users, batch-level metrics are not directly user-attributable.
+- use one of the three approaches below to keep per-user reporting meaningful.
+
+See detailed guide and examples:
+
+- [Hooks guide with multi-user patterns](docs/hooks.md)
+- [Livebook demo](examples/liveview_batch_progress_demo.livemd)
 
 ## Notes
 
 - Start `BatchServing` early in your supervision tree so dependent processes can use it.
-- run/2: executes immediately in the caller process, using only the input you pass right now. It does not wait for or merge work from other processes.
-- batched_run/2: sends the request to the serving process, which briefly queues incoming requests and combines multiple callers’ inputs into one batch (up to batch_size or until batch_timeout), then returns each caller’s portion of the result.
+- `inline/2` executes one item immediately in the caller process.
+- `inline_many/2` executes one explicit batch immediately in the caller process.
+- `dispatch/2` coalesces single-item calls across callers.
+- `dispatch_many/2` coalesces explicit batch calls across callers.

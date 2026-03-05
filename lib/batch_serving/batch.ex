@@ -8,27 +8,18 @@ defmodule BatchServing.Batch do
 
   The `:size` field is public.
   """
-  @enforce_keys [:key]
   @derive {Inspect, only: [:size]}
-  defstruct [:key, values: [], size: 0]
+  defstruct values: [], size: 0
 
   @type t :: %BatchServing.Batch{
           values: list(),
-          size: non_neg_integer(),
-          key: term()
+          size: non_neg_integer()
         }
 
   @doc """
   Returns a new empty batch.
   """
-  def new, do: %BatchServing.Batch{key: :default}
-
-  @doc """
-  Sets the batch key for the given batch.
-  """
-  def key(%BatchServing.Batch{} = batch, key) do
-    %{batch | key: key}
-  end
+  def new, do: %BatchServing.Batch{}
 
   @doc """
   Merges two batches.
@@ -61,22 +52,17 @@ defmodule BatchServing.Batch do
   def merge([]), do: new()
 
   def merge([%BatchServing.Batch{} = head | tail]) do
-    %{values: values, size: size, key: head_key} = head
+    %{values: values, size: size} = head
 
     {values, size} =
       Enum.reduce(tail, {values, size}, fn batch, acc ->
-        %BatchServing.Batch{values: values, size: size, key: tail_key} = batch
+        %BatchServing.Batch{values: values, size: size} = batch
         {acc_values, acc_size} = acc
-
-        if head_key != tail_key do
-          raise ArgumentError,
-                "cannot merge batches with different batch keys: #{inspect(head_key)} and #{inspect(tail_key)}"
-        end
 
         {acc_values ++ values, size + acc_size}
       end)
 
-    %BatchServing.Batch{values: values, size: size, key: head_key}
+    %BatchServing.Batch{values: values, size: size}
   end
 
   @doc """
@@ -96,15 +82,15 @@ defmodule BatchServing.Batch do
     [4, 5]
   """
   def split(%BatchServing.Batch{} = batch, n) when is_integer(n) and n > 0 do
-    %{values: values, size: size, key: key} = batch
+    %{values: values, size: size} = batch
 
     if n < size do
       {high_priority, low_priority} = Enum.split(values, n)
 
       {%{batch | values: high_priority, size: n},
-       %BatchServing.Batch{size: size - n, values: low_priority, key: key}}
+       %BatchServing.Batch{size: size - n, values: low_priority}}
     else
-      {batch, %BatchServing.Batch{key: key}}
+      {batch, %BatchServing.Batch{}}
     end
   end
 
