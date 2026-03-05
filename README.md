@@ -120,8 +120,8 @@ Multi-user note:
 
 See detailed guide and examples:
 
-- [Hooks guide with multi-user patterns](docs/hooks.md)
-- [Livebook demo](examples/liveview_batch_progress_demo.livemd)
+- [Hooks guide with multi-user patterns](docs/hooks.livemd)
+- [Livebook demo](docs/liveview_batch_progress_demo.livemd)
 
 ## Notes
 
