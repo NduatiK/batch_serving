@@ -59,9 +59,9 @@ BatchServing.dispatch_many!(MyServing, [2, 3])
 BatchServing.dispatch!(MyServing, 2)
 #=> 4
 
-BatchServing.dispatch_many(MyServing, ["2"])
+BatchServing.dispatch_many!(MyServing, ["2"])
 #=> !!!! exit !!!!!
-BatchServing.dispatch(MyServing, "2")
+BatchServing.dispatch!(MyServing, "2")
 #=> !!!! exit !!!!!
 
 BatchServing.dispatch_many(MyServing, [2, 3])
