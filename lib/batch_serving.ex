@@ -1,236 +1,15 @@
 defmodule BatchServing do
   @moduledoc """
-  BatchServing encapsulates client and server work to perform batched requests.
+  BatchServing batches work submitted by concurrent callers and executes it
+  as a single request based on batch size and timeout limits.
 
-  Servings can be executed on the fly, without starting a server, but most
-  often they are used to run servers that batch requests until a given size
-  or timeout is reached.
+  You can run a serving inline with `run/2`, or start a serving process and
+  submit requests with `batched_run/2` for transparent cross-caller batching.
 
-  More specifically, servings are a mechanism to apply a computation on a
-  `BatchServing.Batch`, with hooks for preprocessing input from and postprocessing
-  output for the client. Thus we can think of an instance of `t:BatchServing.t/0`
-  (a serving) as something that encapsulates batches of computation.
+  Callbacks:
 
-  ## Inline/serverless workflow
-
-  We can use `new/1` to create a serving that will execute on batches of work:
-
-
-      iex> serving = BatchServing.new(fn a -> Enum.map(a.stack, &(&1 * &1)) end)
-      iex> batch = BatchServing.Batch.stack([1, 2, 3, 4])
-      iex> BatchServing.run(serving, batch)
-      [1, 4, 9, 16]
-
-  When defining a `Serving`, we can also customize how the data is
-  batched by using the `client_preprocessing` as well as the result by
-  using `client_postprocessing` hooks.
-
-      iex> serving = (
-      ...>   BatchServing.new(fn a -> Enum.map(a.stack, &(&1 * &1)) end)
-      ...>   |> BatchServing.client_preprocessing(fn input -> {input, :client_info} end)
-      ...>   |> BatchServing.client_postprocessing(&{&1, &2})
-      ...> )
-      iex> batch = BatchServing.Batch.stack([1, 2, 3, 4])
-      iex> BatchServing.run(serving, batch)
-      {{[1, 4, 9, 16],
-        :server_info},
-       :client_info}
-
-  You can see the results are a bit different now. First of all, notice that
-  we were able to run the serving passing a list of tensors. Our custom
-  `client_preprocessing` function stacks those tensors into a batch of two
-  entries and returns a tuple with a `BatchServing.Batch` struct and additional client
-  information which we represent as the atom `:client_info`. The default
-  client preprocessing simply enforces a batch (or a stream of batches)
-  was given and returns no client information.
-
-  Then the result is a triplet tuple, returned by the client
-  postprocessing function, containing the result, the server information
-  (which we will later learn how to customize), and the client information.
-  From this, we can infer the default implementation of `client_postprocessing`
-  simply returns the result, discarding the server and client information.
-
-  So far, `Serving` has not given us much. It has simply encapsulated the
-  execution of a function. Its full power comes when we start running our own
-  `Serving` process. That's when we will also learn why we have a `client_`
-  prefix in some of the function names.
-
-  ## Stateful/process workflow
-
-  `Serving` allows us to define an Elixir process to handle requests.
-  This process provides several features, such as batching up to a given
-  size or time, partitioning, and distribution over a group of nodes.
-
-  To do so, we need to start a `BatchServing` process with a serving inside
-  a supervision tree:
-
-      children = [
-        {BatchServing,
-         serving: BatchServing.new(fn a -> Enum.map(IO.inspect(a.stack), &(&1 * &1)) end),
-         name: MyServing,
-         batch_size: 10,
-         batch_timeout: 100}
-      ]
-
-      Supervisor.start_child(children, strategy: :one_for_one)
-
-  > Note: in your actual application, you want to make sure
-  > `Serving` comes early in your supervision tree, for example
-  > before your web application endpoint or your data processing
-  > pipelines, as those processes may end-up hitting BatchServing.
-
-  Now you can send batched runs to said process:
-
-      iex> batch = BatchServing.Batch.stack([[1, 2, 3], [4, 5, 6]])
-      iex> BatchServing.batched_run(MyServing, batch)
-      [
-        [2, 4, 6],
-        [8, 10, 12]
-      ]
-
-  In the example, we pushed a batch of 2 and eventually got a reply.
-  The process will wait for requests from other processes, for up to
-  100 milliseconds or until it gets 10 entries. Then it merges all
-  batches together and once the result is computed, it slices and
-  distributes those responses to each caller.
-
-  If there is any `client_preprocessing` function, it will be executed
-  before the batch is sent to the server. If there is any `client_postprocessing`
-  function, it will be executed after getting the response from the
-  server.
-
-  ### Partitioning
-
-  You can start several partitions under the same serving by passing
-  `partitions: integer()` when starting the serving.
-
-  For example:
-
-      children = [
-        {BatchServing,
-         serving: serving,
-         name: MyServing,
-         batch_size: 10,
-         batch_timeout: 100,
-         partitions: 2}
-      ]
-
-  ### Distribution
-
-  All `Serving`s are distributed by default. If the current machine
-  does not have an instance of `Serving` running, `batched_run/3` will
-  automatically look for one in the cluster. The nodes do not need to run
-  the same code and applications. It is only required that they run the
-  same `Nx` version.
-
-  The load balancing between servings is done randomly, however, the number
-  of partitions are considered if the `partitions: true` option is also given.
-
-  The servings are dispatched using Erlang Distribution. You can use
-  `Node.connect/1` to manually connect nodes. In a production setup, this is
-  often done with the help of libraries like [`libcluster`](https://github.com/bitwalker/libcluster).
-
-  ## Advanced notes
-
-  ### Module-based serving
-
-  In the examples so far, we have been using the default version of
-  `Serving`, which executes the given function for each batch.
-
-  However, we can also use `new/2` to start a module-based version of
-  `Serving` which gives us more control over both inline and process
-  workflows. A simple module implementation of a `Serving` could look
-  like this:
-
-      defmodule MyServing do
-        @behaviour BatchServing
-
-        @impl true
-        def init(_inline_or_process, :unused_arg, [defn_options]) do
-          {:ok, fn a -> Enum.map(IO.inspect(a.stack), &(&1 * &1)) end}
-        end
-
-        @impl true
-        def handle_batch(batch, 0, function) do
-          {:execute, fn -> {function.(batch), :server_info} end, function}
-        end
-      end
-
-  It has two functions. The first, `c:init/3`, receives the type of serving
-  (`:inline` or `:process`) and the serving argument.
-
-  The second function is called `c:handle_batch/3`. This function
-  receives a `BatchServing.Batch` and returns a function to execute.
-  The function itself must return a two element-tuple: the batched
-  results and some server information. The server information can
-  be any value and we set it to the atom `:server_info`.
-
-  Now let's give it a try by defining a serving with our module and
-  then running it on a batch:
-
-      iex> serving = BatchServing.new(MyServing, :unused_arg)
-      iex> batch = BatchServing.Batch.stack([[1, 2, 3]])
-      iex> BatchServing.run(serving, batch)
-      [[1, 4, 9]]
-
-  From here on, you use `start_link/1` to start this serving in your
-  supervision and even customize `client_preprocessing/1` and
-  `client_postprocessing/1` callbacks to this serving, as seen in the
-  previous sections.
-
-  Note in our implementation above assumes it won't run partitioned.
-  In partitioned mode, `c:init/3` may receive multiple `defn_options`
-  as the third argument and `c:handle_batch/3` may receive another partition
-  besides 0.
-
-  ### Streaming
-
-  `Serving` allows both inputs and outputs to be streamed.
-
-  In order to stream inputs, you only need to return a stream of `BatchServing.Batch`
-  from the `client_preprocessing` callback. BatchServing will automatically take
-  care of streaming the inputs in, regardless if using `run/2` or `batched_run/2`.
-  It is recommended that the streaming batches have the same size as `batch_size`,
-  to avoid triggering `batch_timeout` on every iteration (except for the last one
-  which may be incomplete).
-
-  To stream outputs, you must invoke `streaming/2` with any additional
-  streaming configuration. When this is invoked, the `client_postprocessing`
-  will receive a stream which you can further manipulate lazily using the
-  functions in the `Stream` module. `streaming/2` also allows you to configure
-  hooks and stream values directly from `Nx.Defn` hooks. However, when hook
-  streaming is enabled, certain capabilities are removed: you cannot stream
-  inputs nor have batches larger than the configured `batch_size`.
-
-  You can enable both input and output streaming at once.
-
-  ### Batch keys
-
-  Sometimes it may be necessary to execute different functions under the
-  same serving.
-
-  Batch keys provide a mechanism to accumulate different batches, based on
-  their key, which execute independently. As an example, we will do a
-  serving which performs different operations based on the batch key,
-  but it could also be used to perform the same operation for different
-  templates:
-
-      iex> serving = BatchServing.new(fn
-      ...>   :double, batch -> Enum.map(batch.stack, fn v -> v * 2 end)
-      ...>   :half, batch -> Enum.map(batch.stack, fn v -> v / 2 end)
-      ...> end)
-      iex> double_batch = BatchServing.Batch.concatenate([0, 1, 2, 3, 4, 5, 6, 7, 8, 9]) |> BatchServing.Batch.key(:double)
-      iex> BatchServing.run(serving, double_batch)
-      [0, 2, 4, 6, 8, 10, 12, 14, 16, 18]
-      iex> half_batch = BatchServing.Batch.concatenate([0, 1, 2, 3, 4, 5, 6, 7, 8, 9]) |> BatchServing.Batch.key(:half)
-      iex> BatchServing.run(serving, half_batch)
-      [0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5]
-
-  When using a process-based serving, you must specify the supported
-  `:batch_keys` when the process is started. The batch keys will be
-  available inside the `defn_options` passed as the third argument of
-  the `c:init/3` callback. The batch keys will also be verified
-  when the batch is returned from the client-preprocessing callback.
+    * `map_input/2` - map caller input into a list of values (or stream of value lists)
+    * `map_result/2` - map serving output into caller-facing result
   """
 
   alias __MODULE__
@@ -240,32 +19,30 @@ defmodule BatchServing do
   defstruct [
     :module,
     :arg,
-    :client_preprocessing,
-    :client_postprocessing,
+    :map_input,
+    :map_result,
     :streaming,
     :batch_size,
     distributed_postprocessing: &Function.identity/1,
     process_options: [],
-    defn_options: []
+    runtime_options: []
   ]
 
-  @type metadata() :: term()
-  @type client_info() :: term()
-  @type client_preprocessing() ::
-          (term() ->
-             {BatchServing.Batch.t() | Enumerable.t(BatchServing.Batch.t()), client_info()})
-  @type client_postprocessing() :: ({list(), metadata()}, client_info() -> term())
+  @type mapped_input_entry() :: list() | {term(), list()}
+  @type mapped_input() :: mapped_input_entry() | Enumerable.t(mapped_input_entry())
+  @type map_input() :: (term() -> mapped_input())
+  @type map_result() :: (term() -> term())
   @type distributed_preprocessing() :: (term() -> term())
   @type distributed_postprocessing() :: (term() -> term())
 
   @type t :: %__MODULE__{
           module: atom(),
           arg: term(),
-          client_preprocessing: client_preprocessing(),
-          client_postprocessing: client_postprocessing(),
+          map_input: map_input(),
+          map_result: map_result(),
           distributed_postprocessing: distributed_postprocessing(),
           process_options: keyword(),
-          defn_options: keyword(),
+          runtime_options: keyword(),
           streaming: nil | %{hooks: [atom()]},
           batch_size: nil | pos_integer()
         }
@@ -286,12 +63,11 @@ defmodule BatchServing do
   The first argument reveals if the serving is executed inline,
   such as by calling `run/2`, by started with the process.
   The second argument is the serving argument given to `new/2`.
-  The third argument option is a list of compiler options to be
-  used to compile each partition the serving will run.
+  The third argument is a list of runtime options for each partition.
 
   It must return `{:ok, state}`, where the `state` can be any term.
   """
-  @callback init(type :: :inline | :process, arg :: term(), [defn_options :: keyword]) ::
+  @callback init(type :: :inline | :process, arg :: term(), [runtime_options :: keyword]) ::
               {:ok, state :: term()}
 
   @doc """
@@ -301,44 +77,26 @@ defmodule BatchServing do
   separate process.
   """
   @callback handle_batch(BatchServing.Batch.t(), partition :: non_neg_integer(), state) ::
-              {:execute, (-> {list(), metadata()}), state}
+              {:execute, (-> term()), state}
             when state: term()
 
   def create_serving_process_group_spec() do
-    %{id: BatchServing.PG, start: {:pg, :start_link, [Serving.PG]}}
+    %{id: BatchServing.PG, start: {:pg, :start_link, [BatchServing.PG]}}
   end
 
   @doc """
   Creates a new function serving.
 
-  It expects a single- or double-arity function. If a single-arity
-  function is given, it receives the compiler options and must
-  return a one-arity function.
+  It expects either:
 
-  If a double-arity function is given, it receives the batch
-  key as first argument and the compiler options as second argument.
-  It must return a one-arity function. The batch keys can be given on
-  `start_link/1`.
-
-  The function will be called with the arguments returned by the
-  `client_preprocessing` callback.
+    * a one-arity function that receives a list of values
+    * a two-arity function that receives `{batch_key, values}`
   """
-  def new(function, defn_options \\ [])
+  def new(function, runtime_options \\ [])
 
-  def new(function, defn_options)
-      when (is_function(function, 1) or is_function(function, 2)) and is_list(defn_options) do
-    new(BatchServing.Default, function, defn_options)
-  end
-
-  def new(function, process_options)
-      when is_function(function, 0) and is_list(process_options) do
-    IO.warn(
-      "passing a zero-arity function to BatchServing.new is deprecated, " <>
-        "please pass a single arity function that will receive the compiler options"
-    )
-
-    new(Serving.Default, fn _ -> function.() end, [])
-    |> process_options(process_options)
+  def new(function, runtime_options)
+      when (is_function(function, 1) or is_function(function, 2)) and is_list(runtime_options) do
+    new(BatchServing.Default, function, runtime_options)
   end
 
   def new(module, arg) when is_atom(module) do
@@ -378,55 +136,35 @@ defmodule BatchServing do
   It expects a module and an argument that is given to its `init`
   callback.
 
-  A third optional argument called `defn_options` are additional
-  compiler options which will be given to the module. Those options
-  will be merged into `Serving.default_options/0`.
+  A third optional argument called `runtime_options` are additional
+  runtime options passed to the module.
   """
-  def new(module, arg, defn_options) when is_atom(module) and is_list(defn_options) do
-    defn_options = Keyword.merge(BatchServing.default_options(), defn_options)
-    %BatchServing{module: module, arg: arg, defn_options: defn_options}
+  def new(module, arg, runtime_options) when is_atom(module) and is_list(runtime_options) do
+    runtime_options = Keyword.merge(BatchServing.default_options(), runtime_options)
+    %BatchServing{module: module, arg: arg, runtime_options: runtime_options}
   end
 
   @doc """
-  Sets the client preprocessing function.
+  Sets the input mapping function.
 
-  The default implementation expects a `BatchServing.Batch` or a stream of
-  BatchServing.Batch to be given as input and return them as is.
+  The default implementation:
+
+    * treats list input as one batch of values
+    * treats list-of-lists input as a stream of value-lists
+    * treats generic enumerable input as a stream of value-lists
+    * wraps any other term into a single-item list
   """
-  def client_preprocessing(%BatchServing{} = serving, function)
+  def map_input(%BatchServing{} = serving, function)
       when is_function(function, 1) or is_nil(function) do
-    %{serving | client_preprocessing: function}
+    %{serving | map_input: function}
   end
 
   @doc """
-  Sets the client postprocessing function.
-
-  The client postprocessing receives a tuple with the
-  `{output, metadata}` or a stream as first argument.
-  The second argument is always the additional information
-  returned by the client preprocessing.
-
-  The default implementation returns either the output or
-  the stream.
+  Sets the result mapping function.
   """
-  def client_postprocessing(%BatchServing{} = serving, function)
-      when is_function(function, 2) or is_nil(function) do
-    %{serving | client_postprocessing: function}
-  end
-
-  def client_postprocessing(%BatchServing{} = serving, function)
-      when is_function(function, 3) do
-    IO.warn(
-      "Passing a 3-arity function to client_postprocessing is deprecated, " <>
-        "instead a two-arity function that receives the output and metadata must be given"
-    )
-
-    %{
-      serving
-      | client_postprocessing: fn {output, metadata}, info ->
-          function.(output, metadata, info)
-        end
-    }
+  def map_result(%BatchServing{} = serving, function)
+      when is_function(function, 1) or is_nil(function) do
+    %{serving | map_result: function}
   end
 
   @doc """
@@ -447,7 +185,7 @@ defmodule BatchServing do
   process that calls `run/2` or `batched_run/2`.
 
   Batches will be streamed as they arrive. You may also opt-in
-  to stream `Nx.Defn` hooks.
+  to stream `runtime` hooks.
 
   ## Options
 
@@ -455,17 +193,17 @@ defmodule BatchServing do
 
   ## Implementation details
 
-  ### Client postprocessing
+  ### Result mapping
 
-  Once streaming is enabled, the client postprocessing callback
+  Once streaming is enabled, the result mapping callback
   will receive a stream which will emit events for each hook
   in the shape of:
 
       {hook_name, term()}
 
   The stream will also receive events in the shape of
-  `{:batch, output, metadata}` as batches are processed by the
-  serving. The client postprocessing is often expected to call
+  `{:batch, output}` as batches are processed by the
+  serving. The result mapping function is often expected to call
   `Stream.transform/3` to process those events into something
   usable by callers.
 
@@ -512,12 +250,10 @@ defmodule BatchServing do
   end
 
   @doc """
-  Sets the defn options of this serving.
-
-  These are the options supported by `Serving.default_options/1`.
+  Sets runtime options for this serving.
   """
-  def defn_options(%BatchServing{} = serving, defn_options) when is_list(defn_options) do
-    %{serving | defn_options: defn_options}
+  def runtime_options(%BatchServing{} = serving, runtime_options) when is_list(runtime_options) do
+    %{serving | runtime_options: runtime_options}
   end
 
   def default_options() do
@@ -535,51 +271,49 @@ defmodule BatchServing do
     %{
       module: module,
       arg: arg,
-      client_preprocessing: preprocessing,
-      client_postprocessing: postprocessing,
-      defn_options: defn_options,
+      map_input: preprocessing,
+      map_result: postprocessing,
+      runtime_options: runtime_options,
       streaming: streaming,
       batch_size: limit
     } = serving
 
-    {batch_or_stream, info} = handle_preprocessing(preprocessing, input)
-    {pid_ref, defn_options} = run_streaming(streaming, defn_options, batch_or_stream, limit)
+    batch_or_stream = handle_preprocessing(preprocessing, input)
+    {pid_ref, runtime_options} = run_streaming(streaming, runtime_options, batch_or_stream, limit)
     stream = run_batch_or_stream(batch_or_stream, limit)
 
     execution_result =
       case pid_ref do
         {pid, ref} ->
-          send(pid, {ref, module, arg, defn_options, stream})
+          send(pid, {ref, module, arg, runtime_options, stream})
           receive_stream("run/2", ref, :unknown)
 
         nil ->
           stream
           |> Enum.map_reduce(nil, fn %BatchServing.Batch{key: key, size: size} = batch, cache ->
             {:ok, state} =
-              cache || handle_init(module, :inline, arg, [[batch_keys: [key]] ++ defn_options])
+              cache || handle_init(module, :inline, arg, [[batch_keys: [key]] ++ runtime_options])
 
             {{run_execute(batch, module, state), size}, {:ok, state}}
           end)
           |> elem(0)
+          |> Enum.map(&elem(&1, 0))
           |> case do
-            [{{output, metadata}, _size}] ->
-              {output, metadata}
-
-            [{{_output, metadata}, _size} | _] = all ->
-              {all, metadata}
+            [single] -> single
+            all -> all
           end
       end
 
-    handle_postprocessing(postprocessing, execution_result, info)
+    handle_postprocessing(postprocessing, execution_result)
   end
 
-  defp run_streaming(nil, defn_options, _batch_or_stream, _limit),
-    do: {nil, defn_options}
+  defp run_streaming(nil, runtime_options, _batch_or_stream, _limit),
+    do: {nil, runtime_options}
 
-  defp run_streaming(%{hooks: []}, defn_options, _batch_or_stream, _limit),
-    do: {run_streaming(), defn_options}
+  defp run_streaming(%{hooks: []}, runtime_options, _batch_or_stream, _limit),
+    do: {run_streaming(), runtime_options}
 
-  defp run_streaming(%{hooks: hooks}, defn_options, batch_or_stream, limit) do
+  defp run_streaming(%{hooks: hooks}, runtime_options, batch_or_stream, limit) do
     size =
       case batch_or_stream do
         %BatchServing.Batch{size: size} ->
@@ -592,34 +326,34 @@ defmodule BatchServing do
 
         _ ->
           raise ArgumentError,
-                "streaming hooks do not support input streaming, input must be a BatchServing.Batch"
+                "streaming hooks do not support input streaming; map_input must produce a single value list"
       end
 
     {pid, ref} = run_streaming()
 
-    defn_options =
-      update_in(defn_options[:hooks], fn acc ->
+    runtime_options =
+      update_in(runtime_options[:hooks], fn acc ->
         Enum.reduce(hooks, acc || %{}, fn hook, acc ->
           Map.put(acc, hook, &run_hook(ref, size, &1, hook))
         end)
       end)
 
-    {{pid, ref}, defn_options}
+    {{pid, ref}, runtime_options}
   end
 
   defp run_streaming do
     pid =
       spawn_link(fn ->
         receive do
-          {ref, module, arg, defn_options, stream} ->
+          {ref, module, arg, runtime_options, stream} ->
             Enum.reduce(stream, {0, nil}, fn
               %BatchServing.Batch{key: key, size: size} = batch, {start, cache} ->
                 {:ok, state} =
                   cache ||
-                    handle_init(module, :inline, arg, [[batch_keys: [key]] ++ defn_options])
+                    handle_init(module, :inline, arg, [[batch_keys: [key]] ++ runtime_options])
 
-                {output, metadata} = run_execute(batch, module, state)
-                send(ref, {ref, {:batch, {0, size, output, metadata}}})
+                output = run_execute(batch, module, state)
+                send(ref, {ref, {:batch, {0, size, output}}})
                 {start + size, {:ok, state}}
             end)
         end
@@ -657,7 +391,7 @@ defmodule BatchServing do
         :ok
 
       other ->
-        raise "client_preprocessing must return a stream of BatchServing.Batch" <>
+        raise "mapped input produced an invalid batch" <>
                 if(limit, do: " of maximum size #{limit}", else: "") <> ", got: #{inspect(other)}"
     end)
   end
@@ -666,8 +400,8 @@ defmodule BatchServing do
     {:execute, function, _} = handle_batch(module, batch, 0, state)
 
     :telemetry.span([:batch_serving, :serving, :execute], %{module: module}, fn ->
-      {output, metadata} = handle_executed(module, function.())
-      {{output, metadata}, %{module: module, metadata: metadata}}
+      output = handle_executed(module, function.())
+      {output, %{module: module}}
     end)
   end
 
@@ -772,48 +506,8 @@ defmodule BatchServing do
   @doc """
   Runs the given `input` on the serving process given by `name`.
 
-  `name` is either an atom representing a local or distributed
-  serving process. First it will attempt to dispatch locally, then it
-  falls back to the distributed serving. You may specify
-  `{:local, name}` to force a local lookup or `{:distributed, name}`
-  to force a distributed one.
-
-  The `client_preprocessing` callback will be invoked on the `input`
-  which is then sent to the server. The server will batch requests
-  and send a response either when the batch is full or on timeout.
-  Then `client_postprocessing` is invoked on the response. See the
-  module documentation for more information. In the distributed case,
-  the callbacks are invoked in the distributed node, but still outside of
-  the serving process.
-
-  Note that you cannot batch an `input` larger than the configured
-  `:batch_size` in the server.
-
-  ## Distributed mode
-
-  To run in distributed mode, the nodes do not need to run the same
-  code and applications. It is only required that they run the
-  same `Nx` version.
-
-  If the current node is running a serving given by `name` locally
-  and `{:distributed, name}` is used, the request will use the same
-  distribution mechanisms instead of being handled locally, which
-  is useful for testing locally without a need to spawn nodes.
-
-  This function receives an optional `distributed_preprocessing` callback as
-  third argument for preprocessing the input for distributed requests. When
-  using libraries like EXLA or Torchx, the tensor is often allocated in memory
-  inside a third-party library so it may be necessary to either transfer or copy
-  the tensor to the binary backend before sending it to another node.
-  This can be done by passing either `Nx.backend_transfer/1` or `Nx.backend_copy/1`
-  as third argument:
-
-      BatchServing.batched_run(MyDistributedServing, input, &Nx.backend_copy/1)
-
-  Use `backend_transfer/1` if you know the input will no longer be used.
-
-  Similarly, the serving has a `distributed_postprocessing` callback which can do
-  equivalent before sending the reply to the caller.
+  `name` may be a local name (`:my_serving`) or explicit routing tuple:
+  `{:local, name}` or `{:distributed, name}`.
   """
   def batched_run(name, input, distributed_preprocessing \\ &Function.identity/1)
 
@@ -834,6 +528,17 @@ defmodule BatchServing do
 
   def batched_run({:distributed, name}, input, distributed_preprocessing) when is_atom(name) do
     distributed_batched_run!(name, input, distributed_preprocessing)
+  end
+
+  @doc """
+  Safe variant of `batched_run/3` that does not exit on runtime failures.
+
+  Returns `{:ok, result}` or `{:error, reason}`.
+  """
+  def batched_run_safe(name, input, distributed_preprocessing \\ &Function.identity/1) do
+    {:ok, batched_run(name, input, distributed_preprocessing)}
+  catch
+    :exit, reason -> {:error, reason}
   end
 
   defp local_batched_run!(pid, name, input) do
@@ -858,7 +563,7 @@ defmodule BatchServing do
             "Make sure your BatchServing is running and/or started as part of your supervision tree"
         )
 
-    {preprocessed, info} = handle_preprocessing(preprocessing, input)
+    preprocessed = handle_preprocessing(preprocessing, input)
 
     ref = :erlang.monitor(:process, pid, alias: :demonitor)
     # ref = Process.monitor(pid, alias: :demonitor)
@@ -878,7 +583,7 @@ defmodule BatchServing do
         stream ->
           if mode == :hooks do
             raise ArgumentError,
-                  "streaming hooks do not support input streaming, input must be a BatchServing.Batch"
+                  "streaming hooks do not support input streaming; map_input must produce a single value list"
           end
 
           spawn_link(fn ->
@@ -897,8 +602,8 @@ defmodule BatchServing do
                   size
 
                 other, _acc ->
-                  raise "client_preprocessing must return a stream of BatchServing.Batch " <>
-                          "of maximum size #{limit}, got: #{inspect(other)}"
+                  raise "mapped input produced an invalid batch of maximum size #{limit}, " <>
+                          "got: #{inspect(other)}"
               end)
 
             receive_size(monitor_ref, ref, acc)
@@ -910,8 +615,8 @@ defmodule BatchServing do
     case mode do
       :execute ->
         case receive_execute(ref, size_or_unknown) do
-          {:ok, tensor, metadata} ->
-            {:ok, handle_postprocessing(postprocessing, {tensor, metadata}, info)}
+          {:ok, value} ->
+            {:ok, handle_postprocessing(postprocessing, value)}
 
           {:DOWN, reason} ->
             {:DOWN, reason}
@@ -919,7 +624,7 @@ defmodule BatchServing do
 
       _ ->
         stream = receive_stream("batched_run/2", ref, size_or_unknown)
-        {:ok, handle_postprocessing(postprocessing, stream, info)}
+        {:ok, handle_postprocessing(postprocessing, stream)}
     end
   end
 
@@ -939,7 +644,7 @@ defmodule BatchServing do
   end
 
   defp distributed_batched_run_with_retries!(name, input, retries) do
-    case :pg.get_members(Serving.PG, __MODULE__) do
+    case :pg.get_members(BatchServing.PG, __MODULE__) do
       [] ->
         exit({:noproc, {__MODULE__, :distributed_batched_run, [name, input, [retries: retries]]}})
 
@@ -1051,9 +756,9 @@ defmodule BatchServing do
               value = Enum.slice(output, hook_start, hook_size)
               {[{hook, value}], index}
 
-            {:batch, {output_start, output_size, output, metadata}} ->
+            {:batch, {output_start, output_size, output}} ->
               value = Enum.slice(output, output_start, output_size)
-              {[{:batch, value, metadata}], index + output_size}
+              {[{:batch, value}], index + output_size}
 
             {:DOWN, reason} ->
               exit({reason, {BatchServing, :streaming, []}})
@@ -1064,29 +769,25 @@ defmodule BatchServing do
   end
 
   defp receive_execute(ref, size) when is_integer(size) or size == :unknown do
-    receive_execute(ref, size, 0, [], nil)
+    receive_execute(ref, size, 0, [])
   end
 
-  defp receive_execute(ref, size, index, acc, template_metadata) do
+  defp receive_execute(ref, size, index, acc) do
     case receive_each(ref, size, index) do
       :done ->
-        {_template, metadata} =
-          template_metadata || raise "unexpected error: streaming finished before it started"
+        {:ok, acc}
 
-        {:ok, acc, metadata}
-
-      {:batch, {output_start, output_size, output, metadata}} ->
+      {:batch, {output_start, output_size, output}} ->
         # If we have a single response, slice and return immediately.
         # Otherwise we collect their contents and build the concatenated result later.
         if acc == [] and output_size + index == size do
-          {:ok, Enum.slice(output, output_start, output_size), metadata}
+          {:ok, Enum.slice(output, output_start, output_size)}
         else
           receive_execute(
             ref,
             size,
             index + output_size,
-            acc ++ Enum.slice(output, output_start, output_size),
-            {output, metadata}
+            acc ++ Enum.slice(output, output_start, output_size)
           )
         end
 
@@ -1104,7 +805,7 @@ defmodule BatchServing do
       {^ref, {:hook, _} = reply} ->
         reply
 
-      {^ref, {:batch, {_output_start, output_size, _output, _metadata}} = reply} ->
+      {^ref, {:batch, {_output_start, output_size, _output}} = reply} ->
         if output_size + index == size do
           Process.demonitor(ref, [:flush])
         end
@@ -1149,15 +850,15 @@ defmodule BatchServing do
       persistent_key(name),
       %{
         limit: batch_size,
-        preprocessing: serving.client_preprocessing,
-        postprocessing: serving.client_postprocessing,
+        preprocessing: serving.map_input,
+        postprocessing: serving.map_result,
         distributed_postprocessing: serving.distributed_postprocessing,
         mode: mode,
         batch_keys: Map.from_keys(batch_keys, [])
       }
     )
 
-    :pg.join(Serving.PG, __MODULE__, List.duplicate(self(), partitions_count))
+    :pg.join(BatchServing.PG, __MODULE__, List.duplicate(self(), partitions_count))
 
     for batch_key <- batch_keys do
       stack_init(batch_key)
@@ -1181,8 +882,8 @@ defmodule BatchServing do
     {:ok, state}
   end
 
-  defp serving_partitions(%BatchServing{defn_options: defn_options}, partitions) do
-    List.duplicate(defn_options, partitions)
+  defp serving_partitions(%BatchServing{runtime_options: runtime_options}, partitions) do
+    List.duplicate(runtime_options, partitions)
   end
 
   defp serving_streaming(%BatchServing{streaming: nil}, partitions) do
@@ -1197,8 +898,8 @@ defmodule BatchServing do
     ets = :ets.new(__MODULE__, [:public, :set, read_concurrency: true])
 
     partitions =
-      Enum.with_index(partitions, fn defn_options, index ->
-        update_in(defn_options[:hooks], fn acc ->
+      Enum.with_index(partitions, fn runtime_options, index ->
+        update_in(runtime_options[:hooks], fn acc ->
           Enum.reduce(hooks, acc || %{}, fn hook, acc ->
             Map.put(acc, hook, &server_hook(ets, index, hook, &1))
           end)
@@ -1427,17 +1128,17 @@ defmodule BatchServing do
             :ets.insert(hooks_table, {partition, ref_sizes})
           end
 
-          {output, metadata} = function.()
+          output = function.()
 
           for {[ref | pids], start, size} <- ref_sizes do
-            send(ref, {ref, {:batch, {start, size, output, metadata}}})
+            send(ref, {ref, {:batch, {start, size, output}}})
 
             for pid <- pids do
               send(pid, {ref, size})
             end
           end
 
-          {:done, %{metadata: metadata, module: module}}
+          {:done, %{module: module}}
         end)
       end
 
@@ -1533,78 +1234,83 @@ defmodule BatchServing do
 
       other ->
         raise "#{inspect(module)}.handle_batch/3 must return {:execute, function, state}, " <>
-                "where function is a function that receives no arguments and returns a tuple. " <>
+                "where function is a function that receives no arguments and returns output. " <>
                 "Got: #{inspect(other)}"
     end
   end
 
-  defp handle_executed(module, result) do
-    case result do
-      {output, metadata} ->
-        {output, metadata}
-
-      other ->
-        raise "the function returned by #{inspect(module)}.handle_batch/3 must return {output, metadata}. " <>
-                "Got: #{inspect(other)}"
-    end
-  end
+  defp handle_executed(_module, result), do: result
 
   defp handle_preprocessing(nil, input) do
-    batch_or_stream =
-      validate_batch_or_stream(input) ||
-        raise(
-          ArgumentError,
-          "the default client_preprocessing expects a BatchServing.Batch or a stream of BatchServing.Batch as input. " <>
-            "Give a batch or use a custom preprocessing"
-        )
+    mapped =
+      cond do
+        is_list(input) -> input
+        Enumerable.impl_for(input) -> input
+        true -> [input]
+      end
 
-    {batch_or_stream, :client_info}
+    mapped_to_batch_or_stream(mapped)
   end
 
   defp handle_preprocessing(preprocessing, input) do
     meta = %{input: input}
 
     :telemetry.span([:batch_serving, :serving, :preprocessing], meta, fn ->
-      result = preprocessing.(input)
+      mapped = preprocessing.(input)
 
-      case result do
-        {batch_or_stream, info} ->
-          batch_or_stream =
-            validate_batch_or_stream(batch_or_stream) ||
-              raise_bad_client_preprocessing!(preprocessing, result)
+      batch_or_stream =
+        mapped_to_batch_or_stream(mapped) || raise_bad_map_input!(preprocessing, mapped)
 
-          {{batch_or_stream, info}, Map.put(meta, :info, info)}
-
-        _ ->
-          raise_bad_client_preprocessing!(preprocessing, result)
-      end
+      {batch_or_stream, meta}
     end)
   end
 
-  defp raise_bad_client_preprocessing!(preprocessing, result) do
-    raise "client_preprocessing function #{inspect(preprocessing)} must return a two element tuple " <>
-            "where the first element is a BatchServing.Batch or a stream of batches and the second is any value. Got: #{inspect(result)}"
+  defp raise_bad_map_input!(preprocessing, result) do
+    raise "map_input function #{inspect(preprocessing)} must return a list of values, " <>
+            "{batch_key, list_of_values}, or a stream of those. Got: #{inspect(result)}"
   end
 
-  defp validate_batch_or_stream(%BatchServing.Batch{size: 0}),
-    do: raise(ArgumentError, "cannot run with empty BatchServing.Batch")
+  defp mapped_to_batch_or_stream({key, values}) when is_list(values) do
+    mapped_entry_to_batch!({key, values})
+  end
 
-  defp validate_batch_or_stream(%BatchServing.Batch{} = batch), do: batch
-
-  defp validate_batch_or_stream(stream) do
-    if Enumerable.impl_for(stream) do
-      stream
+  defp mapped_to_batch_or_stream(values) when is_list(values) do
+    if values != [] and Enum.all?(values, &mapped_entry?/1) do
+      Stream.map(values, &mapped_entry_to_batch!/1)
+    else
+      mapped_entry_to_batch!(values)
     end
   end
 
-  defp handle_postprocessing(nil, {output, _metadata}, _info), do: output
-  defp handle_postprocessing(nil, stream, _info), do: stream
+  defp mapped_to_batch_or_stream(stream) do
+    if Enumerable.impl_for(stream) do
+      Stream.map(stream, &mapped_entry_to_batch!/1)
+    end
+  end
 
-  defp handle_postprocessing(postprocessing, result, info) do
-    meta = %{info: info}
+  defp mapped_entry?({_, values}) when is_list(values), do: true
+  defp mapped_entry?(values) when is_list(values), do: true
+  defp mapped_entry?(_), do: false
 
-    :telemetry.span([:batch_serving, :serving, :postprocessing], meta, fn ->
-      {postprocessing.(result, info), meta}
+  defp mapped_entry_to_batch!({key, values}) when is_list(values) do
+    if values == [], do: raise(ArgumentError, "cannot run with empty value list")
+    BatchServing.Batch.values(values) |> BatchServing.Batch.key(key)
+  end
+
+  defp mapped_entry_to_batch!(values) when is_list(values) do
+    if values == [], do: raise(ArgumentError, "cannot run with empty value list")
+    BatchServing.Batch.values(values)
+  end
+
+  defp mapped_entry_to_batch!(other) do
+    raise "map_input entries must be lists or {batch_key, list} entries, got: #{inspect(other)}"
+  end
+
+  defp handle_postprocessing(nil, result), do: result
+
+  defp handle_postprocessing(postprocessing, result) do
+    :telemetry.span([:batch_serving, :serving, :postprocessing], %{}, fn ->
+      {postprocessing.(result), %{}}
     end)
   end
 end
@@ -1616,21 +1322,21 @@ defmodule BatchServing.Default do
   @impl true
   def init(_type, fun, partitions) do
     batch_funs =
-      Enum.with_index(partitions, fn defn_options, index ->
+      Enum.with_index(partitions, fn runtime_options, index ->
         value =
           cond do
             is_function(fun, 1) ->
-              fun
+              fn batch -> fun.(batch.values) end
 
             is_function(fun, 2) ->
-              {batch_keys, _} = Keyword.pop!(defn_options, :batch_keys)
+              {batch_keys, _} = Keyword.pop!(runtime_options, :batch_keys)
 
               for batch_key <- batch_keys,
                   into: %{},
                   do:
                     {batch_key,
-                     fn value ->
-                       fun.(batch_key, value)
+                     fn batch ->
+                       fun.(batch_key, batch.values)
                      end}
           end
 
@@ -1648,6 +1354,6 @@ defmodule BatchServing.Default do
         %{^partition => fun} -> fun
       end
 
-    {:execute, fn -> {batch_fun.(batch), :server_info} end, batch_funs}
+    {:execute, fn -> batch_fun.(batch) end, batch_funs}
   end
 end

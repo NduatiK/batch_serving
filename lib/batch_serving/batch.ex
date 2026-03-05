@@ -1,8 +1,6 @@
 defmodule BatchServing.Batch do
   @moduledoc """
   Creates a batch of values.
-
-  A batch is lazily traversed, concatenated, and padded upon `defn` invocation.
   """
 
   @doc """
@@ -12,10 +10,10 @@ defmodule BatchServing.Batch do
   """
   @enforce_keys [:key]
   @derive {Inspect, only: [:size]}
-  defstruct [:key, stack: [], size: 0]
+  defstruct [:key, values: [], size: 0]
 
   @type t :: %BatchServing.Batch{
-          stack: list(),
+          values: list(),
           size: non_neg_integer(),
           key: term()
         }
@@ -44,12 +42,12 @@ defmodule BatchServing.Batch do
 
   ## Examples
 
-      iex> batch1 = BatchServing.Batch.stack([1, 2, 3])
-      iex> batch2 = BatchServing.Batch.concatenate(BatchServing.Batch.stack([4, 5]), [6, 7, 8])
+      iex> batch1 = BatchServing.Batch.values([1, 2, 3])
+      iex> batch2 = BatchServing.Batch.values(BatchServing.Batch.values([4, 5]), [6, 7, 8])
       iex> batch = BatchServing.Batch.merge(batch1, batch2)
       iex> batch.size
       8
-      iex> batch.stack
+      iex> batch.values
       [1, 2, 3, 4, 5, 6, 7, 8]
 
   """
@@ -63,22 +61,22 @@ defmodule BatchServing.Batch do
   def merge([]), do: new()
 
   def merge([%BatchServing.Batch{} = head | tail]) do
-    %{stack: stack, size: size, key: head_key} = head
+    %{values: values, size: size, key: head_key} = head
 
-    {stack, size} =
-      Enum.reduce(tail, {stack, size}, fn batch, acc ->
-        %BatchServing.Batch{stack: stack, size: size, key: tail_key} = batch
-        {acc_stack, acc_size} = acc
+    {values, size} =
+      Enum.reduce(tail, {values, size}, fn batch, acc ->
+        %BatchServing.Batch{values: values, size: size, key: tail_key} = batch
+        {acc_values, acc_size} = acc
 
         if head_key != tail_key do
           raise ArgumentError,
                 "cannot merge batches with different batch keys: #{inspect(head_key)} and #{inspect(tail_key)}"
         end
 
-        {acc_stack ++ stack, size + acc_size}
+        {acc_values ++ values, size + acc_size}
       end)
 
-    %BatchServing.Batch{stack: stack, size: size, key: head_key}
+    %BatchServing.Batch{values: values, size: size, key: head_key}
   end
 
   @doc """
@@ -90,105 +88,54 @@ defmodule BatchServing.Batch do
 
   ## Examples
 
-    iex> batch = BatchServing.Batch.concatenate(BatchServing.Batch.stack([1, 2]), [3, 4, 5])
+    iex> batch = BatchServing.Batch.values(BatchServing.Batch.values([1, 2]), [3, 4, 5])
     iex> {left, right} = BatchServing.Batch.split(batch, 3)
-    iex> left.stack
+    iex> left.values
     [1, 2, 3]
-    iex> right.stack
+    iex> right.values
     [4, 5]
   """
   def split(%BatchServing.Batch{} = batch, n) when is_integer(n) and n > 0 do
-    %{stack: stack, size: size, key: key} = batch
+    %{values: values, size: size, key: key} = batch
 
     if n < size do
-      {high_priority, low_priority} = Enum.split(stack, n)
+      {high_priority, low_priority} = Enum.split(values, n)
 
-      {%{batch | stack: high_priority, size: n},
-       %BatchServing.Batch{size: size - n, stack: low_priority, key: key}}
+      {%{batch | values: high_priority, size: n},
+       %BatchServing.Batch{size: size - n, values: low_priority, key: key}}
     else
       {batch, %BatchServing.Batch{key: key}}
     end
   end
 
   @doc """
-  Concatenates the given entries to the batch.
+  Adds the given entries to the batch.
 
-  Entries are concatenated based on their first axis.
-  If the first axis has multiple entries, each entry
-  is added to the size of the batch.
-
-  You can either concatenate to an existing batch
+  You can either add values to an existing batch
   or skip the batch argument to create a new batch.
-
-  See `stack/2` if you want to stack entries instead
-  of concatenating them.
 
   ## Examples
 
   If no batch is given, one is automatically created:
 
-      iex> batch = BatchServing.Batch.concatenate([1, 2, 3])
-      iex> batch.stack
+      iex> batch = BatchServing.Batch.values([1, 2, 3])
+      iex> batch.values
       [1, 2, 3]
 
-  But you can also concatenate to existing batches:
+  But you can also add values to existing batches:
 
-      iex> batch = BatchServing.Batch.concatenate(BatchServing.Batch.stack([1]), ([2]))
-      iex> batch = BatchServing.Batch.concatenate(batch, [3, 4])
-      iex> batch.stack
+      iex> batch = BatchServing.Batch.values(BatchServing.Batch.values([1]), [2])
+      iex> batch = BatchServing.Batch.values(batch, [3, 4])
+      iex> batch.values
       [1, 2, 3, 4]
-
-  If the first axis has multiple entries, each entry counts
-  towards the size of the batch:
-
-      iex> batch = BatchServing.Batch.concatenate(BatchServing.Batch.stack([1, 2]), [3, 4, 5])
-      iex> batch.size
-      5
-      iex> batch.stack
-      [1, 2, 3, 4, 5]
-
-
   """
-  def concatenate(%BatchServing.Batch{} = batch \\ new(), entries) when is_list(entries),
-    do: add(batch, entries)
-
-  @doc """
-  Stacks the given entries to the batch.
-
-  Each entry counts exactly as a single entry.
-  You can either stack to an existing batch
-  or skip the batch argument to create a new batch.
-
-  See `concatenate/2` if you want to concatenate entries
-  instead of stacking them.
-
-  ## Examples
-
-  If no batch is given, one is automatically created:
-
-      iex> batch = BatchServing.Batch.stack([1, 2, 3])
-      iex> batch.size
-      3
-      iex> batch.stack
-      [1, 2, 3]
-
-  But you can also stack an existing batch:
-
-      iex> batch = BatchServing.Batch.stack([1, 2])
-      iex> batch = BatchServing.Batch.stack(batch, [3, 4])
-      iex> batch.size
-      4
-      iex> batch.stack
-      [1, 2, 3, 4]
-
-  """
-  def stack(%BatchServing.Batch{} = batch \\ new(), entries) when is_list(entries),
+  def values(%BatchServing.Batch{} = batch \\ new(), entries) when is_list(entries),
     do: add(batch, entries)
 
   defp add(batch, []), do: batch
 
   defp add(batch, list) do
-    %{stack: stack, size: size} = batch
-    %{batch | stack: stack ++ list, size: size + Enum.count(list)}
+    %{values: values, size: size} = batch
+    %{batch | values: values ++ list, size: size + Enum.count(list)}
   end
 end
