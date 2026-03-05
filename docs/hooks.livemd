@@ -8,21 +8,21 @@ This guide explains what hooks are, when to use them, and how to handle multi-us
 
 With streaming enabled, `BatchServing.dispatch_many/2` returns a stream of events:
 
-* `{:batch, output}` - batch result payloads
-* `{hook_name, payload}` - custom runtime events emitted by your serving implementation
+- `{:batch, output}` - batch result payloads
+- `{hook_name, payload}` - custom runtime events emitted by your serving implementation
 
 Hooks are best for:
 
-* progress reporting in LiveView/UIs
-* runtime telemetry (latency, retries, token/cost estimates)
-* phase/state transitions (`queued`, `embedding`, `persisting`, etc.)
+- progress reporting in LiveView/UIs
+- runtime telemetry (latency, retries, token/cost estimates)
+- phase/state transitions (`queued`, `embedding`, `persisting`, etc.)
 
 ## Concrete embeddings use case
 
 Imagine a "Document Indexing" screen where users upload thousands of text chunks.
 
-* `{:batch, embeddings}` events carry vectors/results.
-* `{:progress, meta}` events carry progress metadata (counts, timings, cost estimates).
+- `{:batch, embeddings}` events carry vectors/results.
+- `{:progress, meta}` events carry progress metadata (counts, timings, cost estimates).
 
 Minimal shape:
 
@@ -67,7 +67,7 @@ end
 parent = self()
 
 DemoServing
-|> BatchServing.dispatch_many(items_with_job_id)
+|> BatchServing.dispatch_many!(items_with_job_id)
 |> Enum.each(fn
   {:progress, metrics} ->
     if my_metrics = Map.get(metrics, my_job_id) do
@@ -81,12 +81,12 @@ end)
 
 Pros:
 
-* good throughput
-* good attribution for billing/reporting
+- good throughput
+- good attribution for billing/reporting
 
 Cons:
 
-* summarized accounting
+- summarized accounting
 
 ## 2) Per-item hook payloads
 
@@ -106,7 +106,7 @@ end
 parent = self()
 
 DemoServing
-|> BatchServing.dispatch_many(items_with_job_id)
+|> BatchServing.dispatch_many!(items_with_job_id)
 |> Enum.reduce(0, fn
   {:progress, items}, acc ->
     # Find your items
@@ -137,12 +137,12 @@ Caller aggregates only entries matching its `job_id`.
 
 Pros:
 
-* keeps batching efficiency
-* accurate per-user/job reporting
+- keeps batching efficiency
+- accurate per-user/job reporting
 
 Cons:
 
-* larger hook payloads
+- larger hook payloads
 
 ## 2) Isolated serving per user/job
 
@@ -160,18 +160,18 @@ name = {:via, Registry, {MyRegistry, {:embedding, user_id}}}
 
 Pros:
 
-* simple attribution
-* batch-level metrics map directly to that user/job
+- simple attribution
+- batch-level metrics map directly to that user/job
 
 Cons:
 
-* lower coalescing efficiency
-* more processes/operational overhead
+- lower coalescing efficiency
+- more processes/operational overhead
 
 ## LiveView example
 
 See:
 
-* [examples/liveview_batch_progress_demo.livemd](../examples/liveview_batch_progress_demo.livemd)
+- [examples/liveview_batch_progress_demo.livemd](../examples/liveview_batch_progress_demo.livemd)
 
 This demo shows streaming progress updates in a LiveView page while work executes in batches.

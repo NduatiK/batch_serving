@@ -54,8 +54,20 @@ Supervisor.start_link(children, strategy: :one_for_one)
 ### 2) Submit work
 
 ```elixir
-BatchServing.dispatch_many(MyServing, [2, 3])
+BatchServing.dispatch_many!(MyServing, [2, 3])
 #=> [4, 9]
+BatchServing.dispatch!(MyServing, 2)
+#=> 4
+
+BatchServing.dispatch_many!(MyServing, [2, 3])
+#=> {:ok, [4, 9]}
+BatchServing.dispatch!(MyServing, 2)
+#=> {:ok, 4}
+
+BatchServing.dispatch_many(MyServing, ["2"])
+#=> {:error, _}
+BatchServing.dispatch(MyServing, "2")
+#=> {:error, _}
 ```
 
 From multiple concurrent callers:
@@ -102,7 +114,7 @@ serving =
   BatchServing.new(MyServingModule, :ok)
   |> BatchServing.streaming(hooks: [:progress])
 
-BatchServing.dispatch_many(MyServing, inputs)
+BatchServing.dispatch_many!(MyServing, inputs)
 |> Enum.each(fn
   {:progress, meta} -> IO.inspect(meta, label: "progress")
   {:batch, output} -> IO.inspect(output, label: "batch")

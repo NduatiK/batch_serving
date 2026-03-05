@@ -73,7 +73,7 @@ defmodule BatchServingTest do
            ]}
         )
 
-      assert [1, 4, 9, 16, 25] == BatchServing.dispatch_many(MyServing, [1, 2, 3, 4, 5])
+      assert [1, 4, 9, 16, 25] == BatchServing.dispatch_many!(MyServing, [1, 2, 3, 4, 5])
     end
 
     test "dispatch many mini example with stream" do
@@ -93,7 +93,7 @@ defmodule BatchServingTest do
 
       input_stream = Stream.map([1, 2, 3], & &1)
 
-      assert [1, 4, 9] == BatchServing.dispatch_many(StreamServing, input_stream)
+      assert [1, 4, 9] == BatchServing.dispatch_many!(StreamServing, input_stream)
     end
 
     test "dispatch many stream treats each streamed list as one item" do
@@ -113,7 +113,7 @@ defmodule BatchServingTest do
 
       input_stream = Stream.map([[1, 2], [3]], & &1)
 
-      assert [3, 3] == BatchServing.dispatch_many(StreamItemServing, input_stream)
+      assert [3, 3] == BatchServing.dispatch_many!(StreamItemServing, input_stream)
     end
 
     test "dispatch many with stream" do
@@ -142,7 +142,7 @@ defmodule BatchServingTest do
                  1..4,
                  fn _ ->
                    data = [1, 2, 3]
-                   BatchServing.dispatch_many(MyServing, data)
+                   BatchServing.dispatch_many!(MyServing, data)
                  end,
                  max_concurrency: 2
                )
@@ -212,7 +212,7 @@ defmodule BatchServingTest do
       started_at = System.monotonic_time(:millisecond)
 
       {events, first_event_latency} =
-        BatchServing.dispatch_many(EarlyStreamServing, [1, 2, 3, 4])
+        BatchServing.dispatch_many!(EarlyStreamServing, [1, 2, 3, 4])
         |> Enum.reduce({[], nil}, fn event, {acc, first_latency} ->
           current_latency = System.monotonic_time(:millisecond) - started_at
           {[event | acc], first_latency || current_latency}
@@ -273,7 +273,7 @@ defmodule BatchServingTest do
            batch_timeout: 100}
         )
 
-      assert [1, 4, 9, 16, 25] == BatchServing.dispatch_many(MyServing, [1, 2, 3, 4, 5])
+      assert [1, 4, 9, 16, 25] == BatchServing.dispatch_many!(MyServing, [1, 2, 3, 4, 5])
     end
 
     defmodule HookStreamingModule do
@@ -310,7 +310,7 @@ defmodule BatchServingTest do
         )
 
       events =
-        BatchServing.dispatch_many(HookStreamServing, [1, 2, 3, 4, 5])
+        BatchServing.dispatch_many!(HookStreamServing, [1, 2, 3, 4, 5])
         |> Enum.to_list()
 
       assert events == [
@@ -347,7 +347,7 @@ defmodule BatchServingTest do
               batch = [i, i + 1]
 
               assert [i ** 2, (i + 1) ** 2] ==
-                       BatchServing.dispatch_many(PartitionedServing, batch)
+                       BatchServing.dispatch_many!(PartitionedServing, batch)
             end,
             max_concurrency: 4
           )
@@ -369,11 +369,23 @@ defmodule BatchServingTest do
            serving: square_serving(), name: SafeServing, batch_size: 10, batch_timeout: 100}
         )
 
-      assert {:ok, [4, 9]} = BatchServing.dispatch_many_safe(SafeServing, [2, 3])
+      assert {:ok, [4, 9]} = BatchServing.dispatch_many(SafeServing, [2, 3])
     end
 
     test "dispatch_safe returns error for missing serving" do
       assert {:error, _reason} = BatchServing.dispatch_safe({:local, MissingServing}, 1)
+    end
+
+    test "dispatch_many returns error tuple for missing serving instead of exiting" do
+      assert {:error, _reason} = BatchServing.dispatch_many({:local, MissingServing}, [1, 2])
+    end
+
+    test "dispatch_many! exits for missing serving" do
+      reason = catch_exit(BatchServing.dispatch_many!({:local, MissingServing}, [1, 2]))
+      assert {:noproc, _details} = reason
+
+      reason = catch_exit(BatchServing.dispatch_many!(MissingServing, [1, 2]))
+      assert {:noproc, _details} = reason
     end
   end
 end

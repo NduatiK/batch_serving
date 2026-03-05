@@ -551,9 +551,9 @@ defmodule BatchServing do
   @doc """
   Runs explicit batch input on the serving process given by `name`.
   """
-  def dispatch_many(name, batch_input, distributed_preprocessing \\ &Function.identity/1)
+  def dispatch_many!(name, batch_input, distributed_preprocessing \\ &Function.identity/1)
 
-  def dispatch_many(name, batch_input, distributed_preprocessing) when is_atom(name) do
+  def dispatch_many!(name, batch_input, distributed_preprocessing) when is_atom(name) do
     if pid = Process.whereis(name) do
       local_batched_run!(pid, name, batch_input, :batch)
     else
@@ -561,7 +561,7 @@ defmodule BatchServing do
     end
   end
 
-  def dispatch_many({:local, name}, batch_input, _distributed_preprocessing)
+  def dispatch_many!({:local, name}, batch_input, _distributed_preprocessing)
       when is_atom(name) do
     pid =
       Process.whereis(name) ||
@@ -570,7 +570,7 @@ defmodule BatchServing do
     local_batched_run!(pid, name, batch_input, :batch)
   end
 
-  def dispatch_many({:distributed, name}, batch_input, distributed_preprocessing)
+  def dispatch_many!({:distributed, name}, batch_input, distributed_preprocessing)
       when is_atom(name) do
     distributed_batched_run!(name, batch_input, distributed_preprocessing, :batch)
   end
@@ -591,8 +591,8 @@ defmodule BatchServing do
 
   Returns `{:ok, result}` or `{:error, reason}`.
   """
-  def dispatch_many_safe(name, batch_input, distributed_preprocessing \\ &Function.identity/1) do
-    {:ok, dispatch_many(name, batch_input, distributed_preprocessing)}
+  def dispatch_many(name, batch_input, distributed_preprocessing \\ &Function.identity/1) do
+    {:ok, dispatch_many!(name, batch_input, distributed_preprocessing)}
   catch
     :exit, reason -> {:error, reason}
   end

@@ -27,9 +27,9 @@ This example shows how to use hooks to track progress when processing many items
 
 Key idea:
 
-* Keep `BatchServing` long-lived and shared.
-* Emit hook events
-* Update the UI using those hooks
+- Keep `BatchServing` long-lived and shared.
+- Emit hook events
+- Update the UI using those hooks
 
 ```elixir
 
@@ -159,10 +159,10 @@ defmodule DemoWeb.Live do
       inputs = Enum.to_list(1..count)
 
       DemoServing
-      |> BatchServing.dispatch_many(inputs)
+      |> BatchServing.dispatch_many!(inputs)
       |> Enum.reduce(0, fn
-        {:progress, 
-          
+        {:progress,
+
            [partition: _partition, running_average: running_average, number_processed: number_processed]
           # %{running_average: running_average, number_processed: number_processed}
           }, acc ->
