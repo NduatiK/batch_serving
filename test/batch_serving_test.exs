@@ -55,7 +55,7 @@ defmodule BatchServingTest do
            ]}
         )
 
-      assert 4 == BatchServing.dispatch(MyServing, 2)
+      assert 4 == BatchServing.dispatch!(MyServing, 2)
     end
 
     test "dispatch many" do
@@ -173,7 +173,7 @@ defmodule BatchServingTest do
                  1..num
                  |> Task.async_stream(
                    fn num ->
-                     BatchServing.dispatch(MyServing, num)
+                     BatchServing.dispatch!(MyServing, num)
                    end,
                    max_concurrency: 4
                  )
@@ -359,7 +359,7 @@ defmodule BatchServingTest do
       assert time_in_seconds < 2.1
     end
 
-    test "dispatch_safe returns ok for successful requests" do
+    test "dispatch_many returns ok for successful requests" do
       {:ok, _pid} =
         start_supervised(%{id: BatchServing.PG, start: {:pg, :start_link, [BatchServing.PG]}})
 
@@ -372,15 +372,21 @@ defmodule BatchServingTest do
       assert {:ok, [4, 9]} = BatchServing.dispatch_many(SafeServing, [2, 3])
     end
 
-    test "dispatch_safe returns error for missing serving" do
-      assert {:error, _reason} = BatchServing.dispatch_safe({:local, MissingServing}, 1)
+    test "dispatch returns error for missing serving" do
+      assert {:error, _reason} = BatchServing.dispatch({:local, MissingServing}, 1)
     end
 
     test "dispatch_many returns error tuple for missing serving instead of exiting" do
       assert {:error, _reason} = BatchServing.dispatch_many({:local, MissingServing}, [1, 2])
     end
 
-    test "dispatch_many! exits for missing serving" do
+    test "dispatch_many!/dispatch! exits for missing serving" do
+      reason = catch_exit(BatchServing.dispatch!({:local, MissingServing}, 2))
+      assert {:noproc, _details} = reason
+
+      reason = catch_exit(BatchServing.dispatch!(MissingServing, 2))
+      assert {:noproc, _details} = reason
+
       reason = catch_exit(BatchServing.dispatch_many!({:local, MissingServing}, [1, 2]))
       assert {:noproc, _details} = reason
 

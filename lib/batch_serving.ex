@@ -504,9 +504,9 @@ defmodule BatchServing do
   @doc """
   Runs a single item on the serving process given by `name`.
   """
-  def dispatch(name, input, distributed_preprocessing \\ &Function.identity/1)
+  def dispatch!(name, input, distributed_preprocessing \\ &Function.identity/1)
 
-  def dispatch(name, input, distributed_preprocessing)
+  def dispatch!(name, input, distributed_preprocessing)
       when is_atom(name) and not is_list(input) do
     [v] =
       if pid = Process.whereis(name) do
@@ -518,12 +518,12 @@ defmodule BatchServing do
     v
   end
 
-  def dispatch(name, _input, _distributed_preprocessing) when is_atom(name) do
+  def dispatch!(name, _input, _distributed_preprocessing) when is_atom(name) do
     raise ArgumentError,
-          "dispatch/3 accepts a single item; use dispatch_many/3 for explicit batches"
+          "dispatch!/3 accepts a single item; use dispatch_many/3 for explicit batches"
   end
 
-  def dispatch({:local, name}, input, _distributed_preprocessing)
+  def dispatch!({:local, name}, input, _distributed_preprocessing)
       when is_atom(name) and not is_list(input) do
     pid =
       Process.whereis(name) || exit({:noproc, {__MODULE__, :local_batched_run, [name, input]}})
@@ -532,20 +532,36 @@ defmodule BatchServing do
     v
   end
 
-  def dispatch({:local, _name}, _input, _distributed_preprocessing) do
+  def dispatch!({:local, _name}, _input, _distributed_preprocessing) do
     raise ArgumentError,
           "dispatch/3 accepts a single item; use dispatch_many/3 for explicit batches"
   end
 
-  def dispatch({:distributed, name}, input, distributed_preprocessing)
-      when is_atom(name) and not is_list(input) do
+  def dispatch!({:distributed, _name}, input, _distributed_preprocessing)
+      when not is_list(input) do
+    raise ArgumentError,
+          "dispatch/3 accepts a single item; use dispatch_many/3 for explicit batches"
+  end
+
+  def dispatch!({:distributed, name}, _input, _distributed_preprocessing)
+      when not is_atom(name) do
+    raise ArgumentError, "Invalid serving name"
+  end
+
+  def dispatch!({:distributed, name}, input, distributed_preprocessing) do
     [v] = distributed_batched_run!(name, input, distributed_preprocessing, :single)
     v
   end
 
-  def dispatch({:distributed, _name}, _input, _distributed_preprocessing) do
-    raise ArgumentError,
-          "dispatch/3 accepts a single item; use dispatch_many/3 for explicit batches"
+  @doc """
+  Safe variant of `dispatch/3` that does not exit on runtime failures.
+
+  Returns `{:ok, result}` or `{:error, reason}`.
+  """
+  def dispatch(name, batch_input, distributed_preprocessing \\ &Function.identity/1) do
+    {:ok, dispatch!(name, batch_input, distributed_preprocessing)}
+  catch
+    :exit, reason -> {:error, reason}
   end
 
   @doc """
@@ -576,18 +592,7 @@ defmodule BatchServing do
   end
 
   @doc """
-  Safe variant of `dispatch/3` that does not exit on runtime failures.
-
-  Returns `{:ok, result}` or `{:error, reason}`.
-  """
-  def dispatch_safe(name, input, distributed_preprocessing \\ &Function.identity/1) do
-    {:ok, dispatch(name, input, distributed_preprocessing)}
-  catch
-    :exit, reason -> {:error, reason}
-  end
-
-  @doc """
-  Safe variant of `dispatch_many/3` that does not exit on runtime failures.
+  Safe variant of `dispatch_many!/3` that does not exit on runtime failures.
 
   Returns `{:ok, result}` or `{:error, reason}`.
   """
