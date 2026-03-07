@@ -294,6 +294,49 @@ defmodule BatchServingTest do
       end
     end
 
+    defmodule RecordingHookStreamingModule do
+      @behaviour BatchServing
+
+      @impl true
+      def init(_inline_or_process, test_pid, options) do
+        {:ok, %{test_pid: test_pid, options: options}}
+      end
+
+      @impl true
+      def handle_batch(
+            %BatchServing.Batch{values: values},
+            partition,
+            %{test_pid: test_pid, options: options} = state
+          ) do
+        hooks = Enum.at(options, partition)[:hooks]
+
+        {:execute,
+         fn ->
+           send(test_pid, {:executed_batch, values})
+           if hook_fun = hooks[:progress], do: hook_fun.(values)
+           values
+         end, state}
+      end
+    end
+
+    defmodule RecordingBatchModule do
+      @behaviour BatchServing
+
+      @impl true
+      def init(_inline_or_process, test_pid, [_options]) do
+        {:ok, test_pid}
+      end
+
+      @impl true
+      def handle_batch(%BatchServing.Batch{values: values} = batch, 0, test_pid) do
+        {:execute,
+         fn ->
+           send(test_pid, {:executed_batch, values, batch.size})
+           values
+         end, test_pid}
+      end
+    end
+
     test "streaming with hooks emits hook events" do
       {:ok, _pid} =
         start_supervised(%{id: BatchServing.PG, start: {:pg, :start_link, [BatchServing.PG]}})
@@ -319,6 +362,153 @@ defmodule BatchServingTest do
                {:progress, [4, 5]},
                {:batch, [40, 50]}
              ]
+    end
+
+    test "streaming hooks preserve explicit batch boundaries across callers" do
+      {:ok, _pid} =
+        start_supervised(%{id: BatchServing.PG, start: {:pg, :start_link, [BatchServing.PG]}})
+
+      {:ok, _pid} =
+        start_supervised(
+          {BatchServing,
+           serving:
+             BatchServing.new(RecordingHookStreamingModule, self())
+             |> BatchServing.streaming(hooks: [:progress]),
+           name: HookBoundaryServing,
+           batch_size: 3,
+           batch_timeout: 50}
+        )
+
+      results =
+        [[1, 2], [3, 4], [5, 6]]
+        |> Task.async_stream(
+          fn batch ->
+            BatchServing.dispatch_many!(HookBoundaryServing, batch)
+            |> Enum.to_list()
+          end,
+          max_concurrency: 3,
+          ordered: true
+        )
+        |> Enum.map(fn {:ok, events} -> events end)
+
+      executed_batches =
+        for _ <- 1..3 do
+          assert_receive {:executed_batch, values}, 1_000
+          values
+        end
+
+      assert results == [
+               [{:progress, [1, 2]}, {:batch, [1, 2]}],
+               [{:progress, [3, 4]}, {:batch, [3, 4]}],
+               [{:progress, [5, 6]}, {:batch, [5, 6]}]
+             ]
+
+      assert executed_batches == [[1, 2], [3, 4], [5, 6]]
+    end
+
+    test "streaming hooks preserve explicit batch boundaries with partitions" do
+      {:ok, _pid} =
+        start_supervised(%{id: BatchServing.PG, start: {:pg, :start_link, [BatchServing.PG]}})
+
+      {:ok, _pid} =
+        start_supervised(
+          {BatchServing,
+           serving:
+             BatchServing.new(RecordingHookStreamingModule, self())
+             |> BatchServing.streaming(hooks: [:progress]),
+           name: HookBoundaryServing,
+           batch_size: 3,
+           partitions: 2,
+           batch_timeout: 50}
+        )
+
+      results =
+        BatchServing.dispatch_many!(HookBoundaryServing, [1, 2, 3, 4, 5])
+        |> Enum.to_list()
+
+      assert results == [
+               {:progress, [1, 2, 3]},
+               {:batch, [1, 2, 3]},
+               {:progress, [4, 5]},
+               {:batch, [4, 5]}
+             ]
+    end
+
+    test "without hooks, concurrent explicit batches are handled 3 at a time" do
+      {:ok, _pid} =
+        start_supervised(%{id: BatchServing.PG, start: {:pg, :start_link, [BatchServing.PG]}})
+
+      {:ok, _pid} =
+        start_supervised(
+          {BatchServing,
+           serving: BatchServing.new(RecordingBatchModule, self()),
+           name: CoalescingServing,
+           batch_size: 3,
+           batch_timeout: 50}
+        )
+
+      results =
+        [[1, 2], [3, 4], [5, 6]]
+        |> Task.async_stream(
+          fn batch -> BatchServing.dispatch_many!(CoalescingServing, batch) end,
+          max_concurrency: 3,
+          ordered: true
+        )
+        |> Enum.map(fn {:ok, values} -> values end)
+
+      executed_batches =
+        for _ <- 1..2 do
+          assert_receive {:executed_batch, values, size}, 1_000
+          {values, size}
+        end
+
+      assert results == [[1, 2], [3, 4], [5, 6]]
+      assert executed_batches == [{[1, 2, 3], 3}, {[4, 5, 6], 3}]
+    end
+
+    test "with hooks, concurrent dispatch callers are still handled 3 at a time" do
+      {:ok, _pid} =
+        start_supervised(%{id: BatchServing.PG, start: {:pg, :start_link, [BatchServing.PG]}})
+
+      {:ok, _pid} =
+        start_supervised(
+          {BatchServing,
+           serving:
+             BatchServing.new(RecordingHookStreamingModule, self())
+             |> BatchServing.streaming(hooks: [:progress]),
+           name: HookDispatchServing,
+           batch_size: 3,
+           batch_timeout: 50}
+        )
+
+      results =
+        1..6
+        |> Task.async_stream(
+          fn value ->
+            BatchServing.dispatch!(HookDispatchServing, value)
+            |> Enum.to_list()
+          end,
+          max_concurrency: 6,
+          ordered: true
+        )
+        |> Enum.map(fn {:ok, events} -> events end)
+
+      executed_batches =
+        for _ <- 1..2 do
+          assert_receive {:executed_batch, values}, 1_000
+          values
+        end
+
+      assert results == [
+               [{:progress, [1]}, {:item, 1}],
+               [{:progress, [2]}, {:item, 2}],
+               [{:progress, [3]}, {:item, 3}],
+               [{:progress, [4]}, {:item, 4}],
+               [{:progress, [5]}, {:item, 5}],
+               [{:progress, [6]}, {:item, 6}]
+             ]
+
+      assert executed_batches == [[1, 2, 3], [4, 5, 6]]
     end
 
     test "partitions" do

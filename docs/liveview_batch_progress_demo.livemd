@@ -27,9 +27,9 @@ This example shows how to use hooks to track progress when processing many items
 
 Key idea:
 
-- Keep `BatchServing` long-lived and shared.
-- Emit hook events
-- Update the UI using those hooks
+* Keep `BatchServing` long-lived and shared.
+* Emit one hook entry per input item
+* Update the UI from hook events as batches complete
 
 ```elixir
 
@@ -45,25 +45,13 @@ defmodule Demo.ProgressServing do
   end
 
   @impl true
-  def init(_type, :ok, [runtime_options | _]) do
-    {:ok,
-     %{
-       hooks: Keyword.get(runtime_options, :hooks, %{}),
-       count: 0,
-       total: 0
-     }}
+  def init(_inline_or_process, _, options) do
+    {:ok, %{options: options}}
   end
 
   @impl true
   def handle_batch(%BatchServing.Batch{values: values}, partition, state) do
-    batch_count = Enum.count(values)
-    batch_total = Enum.reduce(values, 0, fn value, acc -> acc + value * value end)
-
-    new_state = %{
-      state
-      | count: state.count + batch_count,
-        total: state.total + batch_total
-    }
+    hooks = Enum.at(state.options, partition)[:hooks]
 
     {:execute,
      fn ->
@@ -71,16 +59,17 @@ defmodule Demo.ProgressServing do
        Process.sleep(1000)
        output = Enum.map(values, &(&1 * &1))
 
-       if progress_hook = state.hooks[:progress] do
-         progress_hook.(%{
-           running_average: new_state.total / max(new_state.count, 1),
-           number_processed: batch_count,
-           partition: partition
-         })
+       if progress_hook = hooks[:progress] do
+         progress_hook.(
+           Enum.map(values, fn value ->
+             %{partition: partition, digit_count: Enum.count(Integer.digits(value))}
+             # %{partition: partition, digit_count: value}
+           end)
+         )
        end
 
        output
-     end, new_state}
+     end, state}
   end
 end
 ```
@@ -115,7 +104,7 @@ defmodule DemoWeb.Live do
         ({@percent}%)
       </p>
       <p style="margin-top: 0.5rem;">
-        Running average <strong><%= @running_average %></strong>
+        Total Digits Processed <strong><%= @total_digits %></strong>
       </p>
 
       <%= if @done do %>
@@ -141,7 +130,7 @@ defmodule DemoWeb.Live do
       total: count_input,
       processed: 0,
       percent: 0,
-      running_average: 0,
+      total_digits: 0,
       results: []
     )
   end
@@ -160,20 +149,18 @@ defmodule DemoWeb.Live do
 
       DemoServing
       |> BatchServing.dispatch_many!(inputs)
-      |> Enum.reduce(0, fn
-        {:progress,
+      |> Stream.map(&IO.inspect/1)
+      |> Enum.reduce(%{processed: 0, total_digits: 0}, fn
+        {:progress, items}, acc ->
+          processed = acc.processed + Enum.count(items)
+          total_digits = acc.total_digits + Enum.sum_by(items, & &1.digit_count)
 
-           [partition: _partition, running_average: running_average, number_processed: number_processed]
-          # %{running_average: running_average, number_processed: number_processed}
-          }, acc ->
-          total = acc + number_processed
+          acc = %{processed: processed, total_digits: total_digits}
+          
+          send(parent, {:progress, acc})
 
-          send(
-            parent,
-            {:progress, %{running_average: running_average, number_processed: total}}
-          )
-          total
-
+          acc
+|>IO.inspect()
         {:batch, batch_output}, acc ->
           send(parent, {:results, batch_output})
           acc
@@ -187,17 +174,14 @@ defmodule DemoWeb.Live do
      |> assign(running: true)}
   end
 
-  def handle_info(
-        {:progress, %{running_average: running_average, number_processed: number_processed}},
-        socket
-      ) do
-    percent = trunc(number_processed * 100 / max(socket.assigns.total, 1))
+  def handle_info({:progress, %{processed: processed, total_digits: total_digits}}, socket) do
+    percent = trunc(processed * 100 / max(socket.assigns.total, 1))
 
     {:noreply,
      assign(socket,
-       processed: number_processed,
+       processed: processed,
        percent: percent,
-       running_average: running_average
+       total_digits: total_digits
      )}
   end
 

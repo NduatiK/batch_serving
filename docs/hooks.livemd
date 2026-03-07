@@ -2,7 +2,7 @@
 
 ## Section
 
-This guide explains what hooks are, when to use them, and how to handle multi-user progress reporting safely.
+This guide explains what hooks are, when to use them, and what shape hook payloads must have to be routed back to callers correctly.
 
 ## What hooks give you
 
@@ -17,87 +17,58 @@ Hooks are best for:
 - runtime telemetry (latency, retries, token/cost estimates)
 - phase/state transitions (`queued`, `embedding`, `persisting`, etc.)
 
+## Hook payload shape
+
+Hook payloads are sliced back to each caller using the same batch boundaries as
+`{:batch, output}` events. In practice, this means a hook payload should be an
+ordered collection aligned with the batch input, where each element corresponds
+to one input item.
+
+Good fits:
+
+- `[%{processed?: true, token_estimate: 42}, ...]`
+- `[token_count_1, token_count_2, ...]`
+- `[%{job_id: "job-1", latency_ms: 30}, ...]`
+
+Poor fits for the current transport:
+
+- a single aggregate map for the whole execution
+- one scalar count/cost value for the whole batch
+- grouped-by-user maps that do not preserve item order
+
+If you need aggregate metrics, derive them on the caller side from the per-item
+hook entries you receive.
+
 ## Concrete embeddings use case
 
 Imagine a "Document Indexing" screen where users upload thousands of text chunks.
 
 - `{:batch, embeddings}` events carry vectors/results.
-- `{:progress, meta}` events carry progress metadata (counts, timings, cost estimates).
+- `{:progress, meta}` events carry one metadata entry per chunk.
 
 Minimal shape:
 
 ```elixir
-%{
-  processed_delta: 128,
-  latency_ms: 420,
-  estimated_cost_usd: 0.012
-}
+[
+  %{
+    processed_delta: 1,
+    latency_ms: 420,
+    estimated_cost_usd: 0.012
+  },
+  ...
+]
 ```
 
 LiveView can render a progress bar and running status from those events while indexing continues.
 
-## Three approaches for multi-user workloads
-
-When batches can mix requests from different users/jobs, plain batch-level metrics are ambiguous. Use one of these:
-
-## 1) Summarized metrics (recommended for shared batching)
-
-Keep shared batching for throughput, but allocate metrics to users/jobs.
-
-```elixir
-# in handle_batch
-
-if hook = state.hooks[:progress] do
-  hook.(
-    results
-    |> Enum.group_by(& &1.job_id)
-    |> Enum.map(fn {job_id, items} ->
-      {
-        job_id,
-        %{
-          token_estimate: Enum.sum_by(items, & &1.token_estimate),
-          count: Enum.count(items)
-        }
-      }
-    end)
-  )
-end
-
-# in your liveview
-parent = self()
-
-DemoServing
-|> BatchServing.dispatch_many!(items_with_job_id)
-|> Enum.each(fn
-  {:progress, metrics} ->
-    if my_metrics = Map.get(metrics, my_job_id) do
-      send(parent, {:progress, my_metrics})
-    end
-
-  {:batch, batch_output} ->
-    send(parent, {:results, batch_output})
-end)
-```
-
-Pros:
-
-- good throughput
-- good attribution for billing/reporting
-
-Cons:
-
-- summarized accounting
-
-## 2) Per-item hook payloads
-
-Attach `job_id`/`user_id` to each item. Emit hook payload aligned to each item so progress can be attributed per caller.
+## LiveView progress
 
 ```elixir
 # in handle_batch
 if hook = state.hooks[:progress] do
   hook.(
     Enum.map(results, fn result ->
-      %{job_id: result.job_id, token_estimate: result.token_estimate}
+      %{token_estimate: result.token_estimate}
     end)
   )
 end
@@ -107,25 +78,20 @@ parent = self()
 
 DemoServing
 |> BatchServing.dispatch_many!(items_with_job_id)
-|> Enum.reduce(0, fn
+|> Enum.reduce(%{processed: 0, total_tokens: 0}, fn
   {:progress, items}, acc ->
-    # Find your items
-    my_items = Enum.filter(items_with_job_id, &(&1 == my_job_id))
-
-    # Calculate totals
-    number_processed = Enum.count(my_items)
-    batch_tokens = Enum.sum(my_items, & &1.token_estimate)
-    total_tokens = acc + batch_tokens
+    processed = acc.processed + Enum.count(items)
+    total_tokens = acc.total_tokens + Enum.sum_by(items, & &1.token_estimate)
 
     send(
       parent,
       {
         :progress,
-        %{total_tokens: total_tokens, number_processed: total}
+        %{processed: processed, total_tokens: total_tokens}
       }
     )
 
-    total_tokens
+    %{processed: processed, total_tokens: total_tokens}
 
   {:batch, batch_output}, acc ->
     send(parent, {:results, batch_output})
@@ -133,45 +99,13 @@ DemoServing
 end)
 ```
 
-Caller aggregates only entries matching its `job_id`.
-
-Pros:
-
-- keeps batching efficiency
-- accurate per-user/job reporting
-
-Cons:
-
-- larger hook payloads
-
-## 2) Isolated serving per user/job
-
-Run separate serving instances by user/tenant/job key, so no cross-user mixing happens.
-
-```elixir
-name = {:via, Registry, {MyRegistry, {:embedding, user_id}}}
-
-{BatchServing,
- serving: MyEmbeddingServing.serving(),
- name: name,
- batch_size: 128,
- batch_timeout: 50}
-```
-
-Pros:
-
-- simple attribution
-- batch-level metrics map directly to that user/job
-
-Cons:
-
-- lower coalescing efficiency
-- more processes/operational overhead
+LiveView can use hook events to update progress as batches finish while keeping
+a running total of token usage from the metadata emitted for each item.
 
 ## LiveView example
 
 See:
 
-- [examples/liveview_batch_progress_demo.livemd](../examples/liveview_batch_progress_demo.livemd)
+- [examples/liveview_batch_progress_demo.livemd](./liveview_batch_progress_demo.livemd)
 
 This demo shows streaming progress updates in a LiveView page while work executes in batches.

@@ -189,39 +189,49 @@ defmodule BatchServing do
 
   ### Result mapping
 
-  Once streaming is enabled, the result mapping callback
-  will receive a stream which will emit events for each hook
-  in the shape of:
+  Once streaming is enabled, the result mapping callback receives
+  a stream of events in the shape of:
 
       {hook_name, term()}
+      {:batch, output}
 
-  The stream will also receive events in the shape of
-  `{:batch, output}` as batches are processed by the
-  serving. The result mapping function is often expected to call
-  `Stream.transform/3` to process those events into something
-  usable by callers.
+  Hooks currently behave like side-channel batch outputs. They are sliced
+  back to each caller using the same batch boundaries as `{:batch, output}`,
+  so hook payloads should be emitted one entry per input item if you want
+  correct per-caller attribution.
 
-  If the `:hooks` option is given, only a single `:batch` event
-  is emitted, at the end, as detailed next.
+  Good shapes for hook payloads include:
+
+      [%{job_id: "...", tokens: ...}, ...]
+      [token_count1, token_count2, ...]
+      [{:ok, meta1}, {:ok, meta2}, ...]
+
+  Aggregate payloads for the whole execution, such as a single summary map,
+  are not a good fit for the current hook transport.
 
   ### Batch limits
 
-  If you are streaming hooks, the serving server can no longer break
-  batch and you are unable to push a payload bigger than `:batch_size`.
-  For example, imagine you have a `batch_size` of 3 and you push three
-  batches of two elements (AA, BB, and CC). Without hooks, the batches
-  will be consumed as:
+  If you are streaming hooks, the serving server can no longer split
+  explicit batches across executions because hook events must preserve
+  the original batch boundaries.
+
+  This keeps hook events attributable to the explicit batch submitted by
+  each caller.
+
+  For example, with `batch_size` 3, three explicit two-item batches
+  `AA`, `BB`, and `CC` may be packed like this without hooks:
 
       AAB -> BCC
 
-  With streaming, we can't break the batch `BB`, as above, so we will
-  consistently pad with zeroes:
+  With hooks enabled, the middle batch `BB` cannot be split, so each
+  explicit batch runs independently:
 
-      AA0 -> BB0 -> CC0
+      AA -> BB -> CC
 
-  In practice, this should not be a major problem, as you should
-  generally avoid having a batch size that is not a multiple of the
-  most common batches.
+  This restriction applies to server-side execution. If you submit an
+  explicit batch larger than `:batch_size` through `dispatch_many/3`,
+  it will be split before it reaches the server. Inline hook streaming
+  still requires each explicit batch to fit within `:batch_size`.
   """
   def streaming(%BatchServing{} = serving, opts \\ []) do
     hooks = Keyword.get(opts, :hooks, [])
@@ -508,14 +518,12 @@ defmodule BatchServing do
 
   def dispatch!(name, input, distributed_preprocessing)
       when is_atom(name) and not is_list(input) do
-    [v] =
-      if pid = Process.whereis(name) do
-        local_batched_run!(pid, name, input, :single)
-      else
-        distributed_batched_run!(name, input, distributed_preprocessing, :single)
-      end
-
-    v
+    if pid = Process.whereis(name) do
+      local_batched_run!(pid, name, input, :single)
+    else
+      distributed_batched_run!(name, input, distributed_preprocessing, :single)
+    end
+    |> unwrap_dispatch_result
   end
 
   def dispatch!(name, _input, _distributed_preprocessing) when is_atom(name) do
@@ -528,8 +536,9 @@ defmodule BatchServing do
     pid =
       Process.whereis(name) || exit({:noproc, {__MODULE__, :local_batched_run, [name, input]}})
 
-    [v] = local_batched_run!(pid, name, input, :single)
-    v
+    pid
+    |> local_batched_run!(name, input, :single)
+    |> unwrap_dispatch_result
   end
 
   def dispatch!({:local, _name}, _input, _distributed_preprocessing) do
@@ -549,8 +558,21 @@ defmodule BatchServing do
   end
 
   def dispatch!({:distributed, name}, input, distributed_preprocessing) do
-    [v] = distributed_batched_run!(name, input, distributed_preprocessing, :single)
+    name
+    |> distributed_batched_run!(input, distributed_preprocessing, :single)
+    |> unwrap_dispatch_result
+  end
+
+  defp unwrap_dispatch_result([v]) do
     v
+  end
+
+  defp unwrap_dispatch_result(stream) when is_function(stream, 2) do
+    stream
+    |> Stream.map(fn
+      {:batch, [v]} -> {:item, v}
+      hook_event -> hook_event
+    end)
   end
 
   @doc """
