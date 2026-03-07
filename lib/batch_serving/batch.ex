@@ -22,6 +22,18 @@ defmodule BatchServing.Batch do
   def new, do: %BatchServing.Batch{}
 
   @doc """
+  Creates a batch from a list.
+
+  ## Examples
+
+      iex> batch = BatchServing.Batch.from_list([1, 2, 3])
+      iex> batch.values
+      [1, 2, 3]
+  """
+  def from_list(entries) when is_list(entries),
+    do: add_list_items(new(), entries)
+
+  @doc """
   Merges two batches.
 
   The values on the left will appear before the values on the right.
@@ -33,8 +45,8 @@ defmodule BatchServing.Batch do
 
   ## Examples
 
-      iex> batch1 = BatchServing.Batch.values([1, 2, 3])
-      iex> batch2 = BatchServing.Batch.values(BatchServing.Batch.values([4, 5]), [6, 7, 8])
+      iex> batch1 = BatchServing.Batch.from_list([1, 2, 3])
+      iex> batch2 = BatchServing.Batch.extend(BatchServing.Batch.from_list([4, 5]), [6, 7, 8])
       iex> batch = BatchServing.Batch.merge(batch1, batch2)
       iex> batch.size
       8
@@ -74,7 +86,7 @@ defmodule BatchServing.Batch do
 
   ## Examples
 
-    iex> batch = BatchServing.Batch.values(BatchServing.Batch.values([1, 2]), [3, 4, 5])
+    iex> batch = BatchServing.Batch.extend(BatchServing.Batch.from_list([1, 2]), [3, 4, 5])
     iex> {left, right} = BatchServing.Batch.split(batch, 3)
     iex> left.values
     [1, 2, 3]
@@ -102,25 +114,17 @@ defmodule BatchServing.Batch do
 
   ## Examples
 
-  If no batch is given, one is automatically created:
-
-      iex> batch = BatchServing.Batch.values([1, 2, 3])
-      iex> batch.values
-      [1, 2, 3]
-
-  But you can also add values to existing batches:
-
-      iex> batch = BatchServing.Batch.values(BatchServing.Batch.values([1]), [2])
-      iex> batch = BatchServing.Batch.values(batch, [3, 4])
+      iex> batch = BatchServing.Batch.from_list([1, 2])
+      iex> batch = BatchServing.Batch.extend(batch, [3, 4])
       iex> batch.values
       [1, 2, 3, 4]
   """
-  def values(%BatchServing.Batch{} = batch \\ new(), entries) when is_list(entries),
-    do: add(batch, entries)
+  def extend(%BatchServing.Batch{} = batch, entries) when is_list(entries),
+    do: add_list_items(batch, entries)
 
-  defp add(batch, []), do: batch
+  defp add_list_items(batch, []), do: batch
 
-  defp add(batch, list) do
+  defp add_list_items(batch, list) do
     %{values: values, size: size} = batch
     %{batch | values: values ++ list, size: size + Enum.count(list)}
   end

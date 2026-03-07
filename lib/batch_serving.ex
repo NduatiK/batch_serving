@@ -1325,11 +1325,11 @@ defmodule BatchServing do
 
   defp mapped_list_to_batch!(values) when is_list(values) do
     if values == [], do: raise(ArgumentError, "cannot inline with empty value list")
-    BatchServing.Batch.values(values)
+    BatchServing.Batch.from_list(values)
   end
 
   defp mapped_stream_entry_to_batch(value) do
-    BatchServing.Batch.values([value])
+    BatchServing.Batch.from_list([value])
   end
 
   defp handle_postprocessing(nil, result), do: result
