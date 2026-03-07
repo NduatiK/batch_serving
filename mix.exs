@@ -7,7 +7,7 @@ defmodule BatchServing.MixProject do
     [
       app: :batch_serving,
       description: "A serving for batch processing",
-      version: "1.0.1",
+      version: "1.0.2",
       elixir: "~> 1.14",
       start_permanent: Mix.env() == :prod,
       deps: deps(),
