@@ -319,6 +319,32 @@ defmodule BatchServingTest do
       end
     end
 
+    defmodule DelayedPartitionStreamingModule do
+      @behaviour BatchServing
+
+      @impl true
+      def init(_inline_or_process, test_pid, options) do
+        {:ok, %{test_pid: test_pid, options: options}}
+      end
+
+      @impl true
+      def handle_batch(
+            %BatchServing.Batch{values: values},
+            partition,
+            %{test_pid: test_pid, options: options} = state
+          ) do
+        hooks = Enum.at(options, partition)[:hooks]
+
+        {:execute,
+         fn ->
+           if partition == 0, do: Process.sleep(100)
+           send(test_pid, {:executed_batch, partition, values})
+           if hook_fun = hooks[:progress], do: hook_fun.(values)
+           values
+         end, state}
+      end
+    end
+
     defmodule RecordingBatchModule do
       @behaviour BatchServing
 
@@ -411,26 +437,114 @@ defmodule BatchServingTest do
         start_supervised(%{id: BatchServing.PG, start: {:pg, :start_link, [BatchServing.PG]}})
 
       {:ok, _pid} =
-        start_supervised(
-          {BatchServing,
-           serving:
-             BatchServing.new(RecordingHookStreamingModule, self())
-             |> BatchServing.streaming(hooks: [:progress]),
-           name: HookBoundaryServing,
-           batch_size: 3,
-           partitions: 2,
-           batch_timeout: 50}
-        )
+        start_supervised({
+          BatchServing,
+          serving:
+            BatchServing.new(RecordingHookStreamingModule, self())
+            |> BatchServing.streaming(hooks: [:progress]),
+          name: HookBoundaryServing,
+          batch_size: 4,
+          partitions: 2,
+          batch_timeout: 50
+        })
 
       results =
-        BatchServing.dispatch_many!(HookBoundaryServing, [1, 2, 3, 4, 5])
+        BatchServing.dispatch_many!(HookBoundaryServing, Enum.to_list(1..9))
         |> Enum.to_list()
 
       assert results == [
-               {:progress, [1, 2, 3]},
-               {:batch, [1, 2, 3]},
-               {:progress, [4, 5]},
-               {:batch, [4, 5]}
+               {:progress, [1, 2, 3, 4]},
+               {:batch, [1, 2, 3, 4]},
+               {:progress, [5, 6, 7, 8]},
+               {:batch, [5, 6, 7, 8]},
+               {:progress, [9]},
+               {:batch, [9]}
+             ]
+    end
+
+    test "partitioning does not reorder results" do
+      {:ok, _pid} =
+        start_supervised(%{id: BatchServing.PG, start: {:pg, :start_link, [BatchServing.PG]}})
+
+      {:ok, _pid} =
+        start_supervised({
+          BatchServing,
+          serving: BatchServing.new(RecordingHookStreamingModule, self()),
+          name: HookBoundaryServing,
+          batch_size: 4,
+          partitions: 2,
+          batch_timeout: 50
+        })
+
+      results =
+        BatchServing.dispatch_many!(HookBoundaryServing, Enum.to_list(1..9))
+        |> Enum.to_list()
+
+      assert results == Enum.to_list(1..9)
+    end
+
+    test "streaming hooks stay ordered when a later partition finishes first" do
+      {:ok, _pid} =
+        start_supervised(%{id: BatchServing.PG, start: {:pg, :start_link, [BatchServing.PG]}})
+
+      {:ok, _pid} =
+        start_supervised({
+          BatchServing,
+          serving:
+            BatchServing.new(DelayedPartitionStreamingModule, self())
+            |> BatchServing.streaming(hooks: [:progress]),
+          name: InterleavedHookServing,
+          batch_size: 4,
+          partitions: 2,
+          batch_timeout: 50
+        })
+
+      results =
+        BatchServing.dispatch_many!(InterleavedHookServing, Enum.to_list(1..8))
+        |> Enum.to_list()
+
+      assert_receive {:executed_batch, 1, [5, 6, 7, 8]}, 1_000
+      assert_receive {:executed_batch, 0, [1, 2, 3, 4]}, 1_000
+
+      assert results == [
+               {:progress, [1, 2, 3, 4]},
+               {:batch, [1, 2, 3, 4]},
+               {:progress, [5, 6, 7, 8]},
+               {:batch, [5, 6, 7, 8]}
+             ]
+    end
+
+    test "distributed streaming stays ordered when a later partition finishes first" do
+      {:ok, _pid} =
+        start_supervised(%{id: BatchServing.PG, start: {:pg, :start_link, [BatchServing.PG]}})
+
+      {:ok, _pid} =
+        start_supervised({
+          BatchServing,
+          serving:
+            BatchServing.new(DelayedPartitionStreamingModule, self())
+            |> BatchServing.streaming(hooks: [:progress]),
+          name: DistributedInterleavedHookServing,
+          batch_size: 4,
+          partitions: 2,
+          batch_timeout: 50
+        })
+
+      results =
+        BatchServing.dispatch_many!(
+          {:distributed, DistributedInterleavedHookServing},
+          Enum.to_list(1..8)
+        )
+        |> Enum.to_list()
+
+      assert_receive {:executed_batch, 1, [5, 6, 7, 8]}, 1_000
+      assert_receive {:executed_batch, 0, [1, 2, 3, 4]}, 1_000
+
+      assert results == [
+               {:progress, [1, 2, 3, 4]},
+               {:batch, [1, 2, 3, 4]},
+               {:progress, [5, 6, 7, 8]},
+               {:batch, [5, 6, 7, 8]}
              ]
     end
 

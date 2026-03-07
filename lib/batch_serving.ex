@@ -656,11 +656,13 @@ defmodule BatchServing do
           if serving_mode == :hooks and batch.size > limit do
             batch
             |> run_batch_or_stream(limit)
-            |> Enum.each(fn split_batch ->
-              Process.send(pid, {__MODULE__, :dispatch, [ref], split_batch}, [:noconnect])
+            |> Enum.reduce(0, fn split_batch, offset ->
+              refs = {ref, [], offset}
+              Process.send(pid, {__MODULE__, :dispatch, refs, split_batch}, [:noconnect])
+              offset + split_batch.size
             end)
           else
-            Process.send(pid, {__MODULE__, :dispatch, [ref], batch}, [:noconnect])
+            Process.send(pid, {__MODULE__, :dispatch, {ref, [], 0}, batch}, [:noconnect])
           end
 
           size
@@ -680,7 +682,7 @@ defmodule BatchServing do
             pending =
               Enum.reduce(stream, 0, fn
                 %BatchServing.Batch{size: size} = batch, acc when size <= limit ->
-                  refs = [ref, self()]
+                  refs = {ref, [self()], acc}
                   Process.send(pid, {__MODULE__, :dispatch, refs, batch}, [:noconnect])
                   acc + size
 
@@ -817,24 +819,19 @@ defmodule BatchServing do
           raise "the stream returned from BatchServing.#{fun} must be consumed in the same process"
         end
 
-        0
+        %{received: 0, next_offset: 0, pending: %{}}
       end,
       fn
-        ^size ->
+        %{received: ^size} ->
           {:halt, :done}
 
-        index ->
-          case receive_each(ref, size, index) do
+        state ->
+          case receive_stream_event(ref, size, state) do
+            {:emit, event, state} ->
+              {[event], state}
+
             :done ->
               {:halt, :done}
-
-            {:hook, {hook_start, hook_size, output, hook}} ->
-              value = Enum.slice(output, hook_start, hook_size)
-              {[{hook, value}], index}
-
-            {:batch, {output_start, output_size, output}} ->
-              value = Enum.slice(output, output_start, output_size)
-              {[{:batch, value}], index + output_size}
 
             {:DOWN, reason} ->
               exit({reason, {BatchServing, :streaming, []}})
@@ -844,26 +841,80 @@ defmodule BatchServing do
     )
   end
 
+  defp receive_stream_event(ref, size, %{next_offset: next_offset, pending: pending} = state) do
+    case Map.get(pending, next_offset) do
+      [{hook, value} | rest] ->
+        {:emit, {hook, value}, put_pending_events(state, next_offset, rest)}
+
+      [{:batch, value, output_size} | rest] ->
+        state =
+          state
+          |> put_pending_events(next_offset, rest)
+          |> Map.update!(:received, &(&1 + output_size))
+          |> Map.update!(:next_offset, &(&1 + output_size))
+
+        {:emit, {:batch, value}, state}
+
+      nil ->
+        receive do
+          {^ref, {:hook, {hook_start, hook_size, output, hook, request_offset}}} ->
+            value = Enum.slice(output, hook_start, hook_size)
+            state = update_pending_events(state, request_offset, {hook, value})
+            receive_stream_event(ref, size, state)
+
+          {^ref, {:batch, {output_start, output_size, output, request_offset}}} ->
+            value = Enum.slice(output, output_start, output_size)
+            state = update_pending_events(state, request_offset, {:batch, value, output_size})
+            receive_stream_event(ref, size, state)
+
+          {:DOWN, ^ref, _, _, :normal} ->
+            Process.demonitor(ref, [:flush])
+
+            if state.received == size do
+              :done
+            else
+              {:DOWN, :normal}
+            end
+
+          {:DOWN, ^ref, _, _, reason} ->
+            Process.demonitor(ref, [:flush])
+            {:DOWN, reason}
+        end
+    end
+  end
+
+  defp update_pending_events(%{pending: pending} = state, request_offset, event) do
+    Map.put(state, :pending, Map.update(pending, request_offset, [event], &(&1 ++ [event])))
+  end
+
+  defp put_pending_events(%{pending: pending} = state, request_offset, []),
+    do: Map.put(state, :pending, Map.delete(pending, request_offset))
+
+  defp put_pending_events(%{pending: pending} = state, request_offset, events),
+    do: Map.put(state, :pending, Map.put(pending, request_offset, events))
+
   defp receive_execute(ref, size) when is_integer(size) or size == :unknown do
     receive_execute(ref, size, 0, [])
   end
 
-  defp receive_execute(ref, size, index, acc) do
-    case receive_each(ref, size, index) do
+  defp receive_execute(ref, size, received, acc) do
+    case receive_each(ref, size, received) do
       :done ->
-        {:ok, acc}
+        {:ok, acc |> Enum.sort_by(&elem(&1, 0)) |> Enum.flat_map(&elem(&1, 1))}
 
-      {:batch, {output_start, output_size, output}} ->
+      {:batch, {output_start, output_size, output, request_offset}} ->
+        value = Enum.slice(output, output_start, output_size)
+
         # If we have a single response, slice and return immediately.
         # Otherwise we collect their contents and build the concatenated result later.
-        if acc == [] and output_size + index == size do
-          {:ok, Enum.slice(output, output_start, output_size)}
+        if acc == [] and output_size + received == size and request_offset == 0 do
+          {:ok, value}
         else
           receive_execute(
             ref,
             size,
-            index + output_size,
-            acc ++ Enum.slice(output, output_start, output_size)
+            received + output_size,
+            [{request_offset, value} | acc]
           )
         end
 
@@ -881,7 +932,7 @@ defmodule BatchServing do
       {^ref, {:hook, _} = reply} ->
         reply
 
-      {^ref, {:batch, {_output_start, output_size, _output}} = reply} ->
+      {^ref, {:batch, {_output_start, output_size, _output, _request_offset}} = reply} ->
         if output_size + index == size do
           Process.demonitor(ref, [:flush])
         end
@@ -982,8 +1033,8 @@ defmodule BatchServing do
   end
 
   defp server_hook(ets, index, hook, result) do
-    for {[ref | _pids], start, size} <- :ets.lookup_element(ets, index, 2) do
-      send(ref, {ref, {:hook, {start, size, result, hook}}})
+    for {{ref, _pids, request_offset}, start, size} <- :ets.lookup_element(ets, index, 2) do
+      send(ref, {ref, {:hook, {start, size, result, hook, request_offset}}})
     end
   end
 
@@ -1087,7 +1138,7 @@ defmodule BatchServing do
     end
 
     # As well as for entries in the stack.
-    for {[ref | _pids], _batch} <- stack_entries() do
+    for {{ref, _pids, _request_offset}, _batch} <- stack_entries() do
       send(ref, {:DOWN, ref, :process, self(), :noproc})
     end
 
@@ -1111,7 +1162,7 @@ defmodule BatchServing do
   end
 
   defp server_reply_down(reason, ref_sizes) do
-    for {[ref | _refs], _start, _size} <- ref_sizes do
+    for {{ref, _pids, _request_offset}, _start, _size} <- ref_sizes do
       send(ref, {:DOWN, ref, :process, self(), reason})
     end
   end
@@ -1126,11 +1177,12 @@ defmodule BatchServing do
 
       size + count > limit ->
         {current, batch} = BatchServing.Batch.split(batch, limit - count)
+        next_refs = refs_advance(refs, current.size)
 
         state
         |> server_stack(refs, current, :skip_timer)
         |> server_execute()
-        |> server_stack_and_execute_loop(batch, 0, refs)
+        |> server_stack_and_execute_loop(batch, 0, next_refs)
 
       true ->
         state
@@ -1200,8 +1252,8 @@ defmodule BatchServing do
 
           output = function.()
 
-          for {[ref | pids], start, size} <- ref_sizes do
-            send(ref, {ref, {:batch, {start, size, output}}})
+          for {{ref, pids, request_offset}, start, size} <- ref_sizes do
+            send(ref, {ref, {:batch, {start, size, output, request_offset}}})
 
             for pid <- pids do
               send(pid, {ref, size})
@@ -1283,6 +1335,10 @@ defmodule BatchServing do
 
   defp persistent_key(name) when is_atom(name) do
     {__MODULE__, name}
+  end
+
+  defp refs_advance({ref, pids, request_offset}, size) do
+    {ref, pids, request_offset + size}
   end
 
   defp handle_init(module, type, arg, [_ | _] = partitions) do
